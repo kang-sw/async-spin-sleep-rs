@@ -1,6 +1,6 @@
 [package]
 name = "async-spin-sleep"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 description = "A crate providing a highly accurate asynchronous timer for multiple async tasks using spin sleep in a single thread."
 repository = "https://github.com/kang-sw/async-spin-sleep-rs"
@@ -21,3 +21,6 @@ enum-as-inner = "0.6"
 [dev-dependencies]
 tokio = { version = "1.28", features = ["full"] }
 futures = "0.3"
+
+[features]
+no-bheap-retain = []

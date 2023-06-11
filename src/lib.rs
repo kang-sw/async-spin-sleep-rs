@@ -132,14 +132,25 @@ mod driver {
                     n_garbage += 1;
 
                     if n_garbage > this.collect_garbage_at {
-                        nodes.retain(|x| {
+                        let fn_retain = |x: &Node| {
                             if let Some(_) = aborts.take(&x.desc.id) {
                                 n_garbage -= 1;
                                 false
                             } else {
                                 true
                             }
-                        });
+                        };
+
+                        #[cfg(not(feature = "no-bheap-retain"))]
+                        nodes.retain(fn_retain);
+
+                        #[cfg(feature = "no-bheap-retain")]
+                        {
+                            let mut vec = nodes.into_vec();
+                            vec.retain(fn_retain);
+
+                            nodes = BinaryHeap::from(vec);
+                        }
 
                         debug_assert!(n_garbage == 0);
                         debug_assert!(aborts.is_empty());

@@ -6,6 +6,9 @@
 
 As this crate internally utilizes `BinaryHeap::retain` method, it requires rust compiler version 1.70.0
 
+if feature `no-bheap-retain` is enabled, the `retain` method will be replaced with a bit more
+permissive but inefficient algorithm.
+
 ## Usage
 
 To use **async-spin-sleep**, add the following line to your `Cargo.toml` file:
