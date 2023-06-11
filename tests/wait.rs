@@ -5,7 +5,7 @@ async fn verify_api() {
     let init = async_spin_sleep::Init::default();
     let handle = init.handle();
 
-    std::thread::spawn(move || init.execute());
+    std::thread::spawn(move || init.blocking_execute());
     for sleep in join_all(
         (0..100).rev().map(|i| handle.sleep_for(std::time::Duration::from_micros(i) * 150)),
     )
@@ -21,7 +21,7 @@ async fn discard_half() {
     init.collect_garbage_at = 3;
     let handle = init.handle();
 
-    std::thread::spawn(move || init.execute());
+    std::thread::spawn(move || init.blocking_execute());
     for sleep in join_all((0..100).rev().map(|i| {
         let handle = handle.clone();
         async move {

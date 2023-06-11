@@ -1,3 +1,34 @@
+//! This library provides a timer driver for scheduling and executing timed operations. The driver
+//! allows you to create handles for sleeping for a specific duration or until a specified timeout.
+//! It operates in a concurrent environment and uses a binary heap for efficient scheduling of
+//! events.
+//!
+//! # Example
+//!
+//! ```rust
+//! use async_spin_sleep::Init;
+//! use std::time::Duration;
+//!
+//! // Initialize the timer driver
+//! let timer = Init::default();
+//!
+//! // Create a handle for sleeping for 1 second
+//! let handle = timer.handle();
+//!
+//! // Spawn the driver on a separate thread.
+//! // The timer will be dropped when all handles are dropped.
+//! std::thread::spawn(move || timer.blocking_execute());
+//!
+//! let sleep_future = handle.sleep_for(Duration::from_secs(1));
+//!
+//! // Wait for the sleep future to complete
+//! let result = futures::executor::block_on(sleep_future);
+//! if let Ok(overly) = result {
+//!     println!("Sleep {:?} more than requested", overly);
+//! } else {
+//!     println!("Sleep error: {:?}", result.err());
+//! }
+//! ```
 use std::{
     pin::Pin,
     sync::{atomic::AtomicUsize, mpsc},
@@ -45,7 +76,7 @@ impl Init {
     }
 
     /// Blocks current thread, executing the driver.
-    pub fn execute(mut self) {
+    pub fn blocking_execute(mut self) {
         let (_, rx) = self.channel.take().unwrap();
         driver::execute(self, rx)
     }
@@ -193,10 +224,16 @@ pub struct Handle {
 }
 
 impl Handle {
+    /// Returns a future that sleeps for the specified duration.
+    ///
+    /// [`SleepFuture`] returns the duration that overly passed the specified duration.
     pub fn sleep_for(&self, duration: Duration) -> SleepFuture {
         self.sleep_until(Instant::now() + duration)
     }
 
+    /// Returns a future that sleeps until the specified instant.
+    ///
+    /// [`SleepFuture`] returns the duration that overly passed the specified instant.
     pub fn sleep_until(&self, timeout: Instant) -> SleepFuture {
         static COUNTER: AtomicUsize = AtomicUsize::new(0);
 

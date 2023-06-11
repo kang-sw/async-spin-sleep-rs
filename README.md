@@ -21,7 +21,7 @@ async fn main() {
     let init = Init::default();
     let handle = init.handle();
 
-    std::thread::spawn(move || init.execute());
+    std::thread::spawn(move || init.blocking_execute());
     for sleep in join_all(
         (0..100).rev().map(|i| handle.sleep_for(std::time::Duration::from_micros(i) * 150)),
     )
@@ -81,7 +81,7 @@ fn main() {
 
     std::thread::spawn(move || {
         increase_thread_priority(thread::current(), MAX);
-        init.execute();
+        init.blocking_execute();
     });
 
     // Rest of your code...
