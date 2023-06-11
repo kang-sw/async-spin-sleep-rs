@@ -6,9 +6,36 @@ async fn verify_api() {
     let handle = init.handle();
 
     std::thread::spawn(move || init.execute());
-    for sleep in
-        join_all((0..100).rev().map(|i| handle.sleep_for(std::time::Duration::from_millis(i))))
-            .await
+    for sleep in join_all(
+        (0..100).rev().map(|i| handle.sleep_for(std::time::Duration::from_micros(i) * 150)),
+    )
+    .await
+    {
+        println!("{sleep:?}");
+    }
+}
+
+#[tokio::test]
+async fn discard_half() {
+    let mut init = async_spin_sleep::Init::default();
+    init.collect_garbage_at = 3;
+    let handle = init.handle();
+
+    std::thread::spawn(move || init.execute());
+    for sleep in join_all(
+        (0..100)
+            .rev()
+            .map(|i| handle.sleep_for(std::time::Duration::from_micros(i) * 150))
+            .enumerate()
+            .map(|x| async move {
+                if x.0 % 2 == 0 {
+                    Some(x.1.await)
+                } else {
+                    None
+                }
+            }),
+    )
+    .await
     {
         println!("{sleep:?}");
     }

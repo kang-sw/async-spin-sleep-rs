@@ -19,13 +19,13 @@ pub struct Init {
     /// CPU usage of the driver, but may also dangerously increase the chance of missing a wakeup
     /// event.
     #[builder(default = DEFAULT_SCHEDULE_RESOLUTION)]
-    schedule_resolution: Duration,
+    pub schedule_resolution: Duration,
 
     /// Aborted nodes that are too far from execution may remain in the driver's memory for a long
     /// time. This value specifies the maximum number of aborted nodes that can be stored in the
     /// driver's memory. If this value is exceeded, the driver will collect garbage.
     #[builder(default = 10000)]
-    collect_garbage_at: usize,
+    pub collect_garbage_at: usize,
 
     // For internal use
     #[builder(default = Some(mpsc::channel()), setter(skip))]
@@ -64,6 +64,7 @@ mod driver {
 
     use crate::Init;
 
+    #[derive(Debug)]
     pub(crate) enum Event {
         SleepUntil(NodeDesc, Waker),
         Abort(NodeDesc),
@@ -98,13 +99,13 @@ mod driver {
                     loop {
                         let now = Instant::now();
                         if now >= node.desc.timeout {
-                            dbg!(now - node.desc.timeout);
                             // This is the only point where a node is executed.
                             let node = nodes.pop().unwrap();
-                            node.waker.wake();
 
                             if let Some(_) = aborts.take(&node.desc.id) {
                                 n_garbage -= 1;
+                            } else {
+                                node.waker.wake();
                             }
 
                             cursor_timeout = node.desc.timeout;
@@ -150,10 +151,20 @@ mod driver {
         }
     }
 
-    #[derive(Debug, Eq, PartialEq, Ord, PartialOrd, Clone, Copy)]
+    #[derive(Debug, Eq, PartialEq, Clone, Copy, Educe)]
+    #[educe(PartialOrd, Ord)]
     pub(crate) struct NodeDesc {
+        #[educe(PartialOrd(method = "cmp_rev_partial"), Ord(method = "cmp_rev"))]
         pub timeout: Instant,
         pub id: usize,
+    }
+
+    fn cmp_rev(a: &Instant, b: &Instant) -> std::cmp::Ordering {
+        b.cmp(a)
+    }
+
+    fn cmp_rev_partial(a: &Instant, b: &Instant) -> Option<std::cmp::Ordering> {
+        b.partial_cmp(a)
     }
 
     #[derive(Debug, Educe)]
