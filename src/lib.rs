@@ -27,13 +27,15 @@
 //! }
 //! ```
 use std::{
+    mem::replace,
     pin::Pin,
-    sync::atomic::AtomicUsize,
+    sync::Arc,
     task::{Context, Poll},
     time::{Duration, Instant},
 };
 
 use crossbeam::channel;
+use driver::{NodeDesc, WakerCell};
 
 /* -------------------------------------------- Init -------------------------------------------- */
 #[cfg(windows)]
@@ -68,7 +70,7 @@ impl Default for Builder {
     fn default() -> Self {
         Self {
             schedule_resolution: DEFAULT_SCHEDULE_RESOLUTION,
-            collect_garbage_at: 128,
+            collect_garbage_at: 1000,
             channel_capacity: None,
             _0: (),
         }
@@ -96,11 +98,7 @@ pub fn create() -> (Handle, impl FnOnce()) {
 
 /* ------------------------------------------- Driver ------------------------------------------- */
 mod driver {
-    use std::{
-        collections::{BTreeSet, BinaryHeap},
-        task::Waker,
-        time::Instant,
-    };
+    use std::{cell::UnsafeCell, collections::BinaryHeap, sync::Weak, task::Waker, time::Instant};
 
     use crossbeam::channel::{self, TryRecvError};
     use educe::Educe;
@@ -109,8 +107,10 @@ mod driver {
 
     #[derive(Debug)]
     pub(crate) enum Event {
-        SleepUntil(NodeDesc, Waker),
-        Abort(NodeDesc),
+        SleepUntil(NodeDesc),
+
+        /// The second argument enforces sequential execution of all commands
+        Abort(Instant),
     }
 
     /// ```plain
@@ -124,16 +124,15 @@ mod driver {
     ///     wait condvar
     /// ```
     pub(crate) fn execute(this: Builder, rx: channel::Receiver<Event>) {
-        let mut nodes = BinaryHeap::<Node>::new();
-        let mut aborts = BTreeSet::<usize>::new();
-        let mut n_garbage = 0usize;
-        let mut cursor_timeout = Instant::now(); // prevents expired node abortion
+        let mut nodes = BinaryHeap::<NodeDesc>::new();
+        let mut n_estimated_garbage = 0usize;
+        let mut timeout_cursor = Instant::now();
 
         'outer: loop {
             let now = Instant::now();
 
             let mut event = if let Some(node) = nodes.peek() {
-                let remain = node.desc.timeout.saturating_duration_since(now);
+                let remain = node.timeout.saturating_duration_since(now);
                 if remain > this.schedule_resolution {
                     let system_sleep_for = remain - this.schedule_resolution;
                     let Ok(x) = rx.recv_timeout(system_sleep_for) else { continue };
@@ -141,17 +140,18 @@ mod driver {
                 } else {
                     loop {
                         let now = Instant::now();
-                        if now >= node.desc.timeout {
+                        if now >= node.timeout {
                             // This is the only point where a node is executed.
                             let node = nodes.pop().unwrap();
 
-                            if let Some(_) = aborts.take(&node.desc.id) {
-                                n_garbage -= 1;
+                            if let Some(waker) = node.waker.upgrade() {
+                                // SAFETY: No other thread access value of this pointer.
+                                unsafe { (*waker.get()).take().unwrap().wake() }
                             } else {
-                                node.waker.wake();
+                                n_estimated_garbage = n_estimated_garbage.saturating_sub(1);
                             }
 
-                            cursor_timeout = node.desc.timeout;
+                            timeout_cursor = node.timeout;
                             continue 'outer;
                         } else {
                             match rx.try_recv() {
@@ -169,34 +169,26 @@ mod driver {
 
             loop {
                 match event {
-                    Event::SleepUntil(desc, waker) => nodes.push(Node { waker, desc }),
+                    Event::SleepUntil(desc) => nodes.push(desc),
 
-                    Event::Abort(node) if node.timeout > cursor_timeout => {
-                        aborts.insert(node.id);
-                        n_garbage += 1;
+                    Event::Abort(timeout) if timeout > timeout_cursor => {
+                        n_estimated_garbage += 1;
 
-                        if n_garbage > this.collect_garbage_at {
-                            let fn_retain = |x: &Node| {
-                                if let Some(_) = aborts.take(&x.desc.id) {
-                                    n_garbage -= 1;
-                                    false
-                                } else {
-                                    true
-                                }
-                            };
+                        if n_estimated_garbage > this.collect_garbage_at {
+                            let fn_retain = |x: &NodeDesc| x.waker.strong_count() > 0;
 
                             #[rustversion::since(1.70)]
                             fn retain(
-                                this: &mut BinaryHeap<Node>,
-                                fn_retain: impl FnMut(&Node) -> bool,
+                                this: &mut BinaryHeap<NodeDesc>,
+                                fn_retain: impl FnMut(&NodeDesc) -> bool,
                             ) {
                                 this.retain(fn_retain);
                             }
 
                             #[rustversion::before(1.70)]
                             fn retain(
-                                this: &mut BinaryHeap<Node>,
-                                fn_retain: impl FnMut(&Node) -> bool,
+                                this: &mut BinaryHeap<NodeDesc>,
+                                fn_retain: impl FnMut(&NodeDesc) -> bool,
                             ) {
                                 let nodes = std::mem::take(this);
                                 let mut vec = nodes.into_vec();
@@ -205,19 +197,11 @@ mod driver {
                             }
 
                             retain(&mut nodes, fn_retain);
-
-                            debug_assert_eq!(
-                                n_garbage,
-                                0,
-                                "grabages: {:?}, nodes: {:?}",
-                                aborts.len(),
-                                nodes.len()
-                            );
-                            debug_assert!(aborts.is_empty());
+                            n_estimated_garbage = 0;
                         }
                     }
 
-                    Event::Abort(_) => (), // It is safe to ignore.
+                    Event::Abort(_) => (),
                 };
 
                 // Consume all events in the channel.
@@ -230,12 +214,14 @@ mod driver {
         }
     }
 
-    #[derive(Debug, Eq, PartialEq, Clone, Copy, Educe)]
-    #[educe(PartialOrd, Ord)]
+    #[derive(Debug, Clone, Educe)]
+    #[educe(Eq, PartialEq, PartialOrd, Ord)]
     pub(crate) struct NodeDesc {
         #[educe(PartialOrd(method = "cmp_rev_partial"), Ord(method = "cmp_rev"))]
         pub timeout: Instant,
-        pub id: usize,
+
+        #[educe(Eq(ignore), PartialEq(ignore), PartialOrd(ignore), Ord(ignore))]
+        pub waker: Weak<WakerCell>,
     }
 
     fn cmp_rev(a: &Instant, b: &Instant) -> std::cmp::Ordering {
@@ -246,12 +232,24 @@ mod driver {
         b.partial_cmp(a)
     }
 
-    #[derive(Debug, Educe)]
-    #[educe(PartialEq, Eq, PartialOrd, Ord)]
-    struct Node {
-        #[educe(PartialEq(ignore), Eq(ignore), PartialOrd(ignore), Ord(ignore))]
-        waker: Waker,
-        desc: NodeDesc,
+    #[derive(Debug)]
+    pub(crate) struct WakerCell(UnsafeCell<Option<Waker>>);
+
+    unsafe impl Sync for WakerCell {}
+    unsafe impl Send for WakerCell {}
+
+    impl std::ops::Deref for WakerCell {
+        type Target = UnsafeCell<Option<Waker>>;
+
+        fn deref(&self) -> &Self::Target {
+            &self.0
+        }
+    }
+
+    impl WakerCell {
+        pub fn new(waker: Waker) -> Self {
+            Self(UnsafeCell::new(Some(waker)))
+        }
     }
 }
 
@@ -273,16 +271,7 @@ impl Handle {
     ///
     /// [`SleepFuture`] returns the duration that overly passed the specified instant.
     pub fn sleep_until(&self, timeout: Instant) -> SleepFuture {
-        static COUNTER: AtomicUsize = AtomicUsize::new(0);
-
-        SleepFuture {
-            tx: self.tx.clone(),
-            state: SleepState::Pending,
-            desc: driver::NodeDesc {
-                timeout,
-                id: COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-            },
-        }
+        SleepFuture { tx: self.tx.clone(), state: SleepState::Pending, timeout }
     }
 }
 
@@ -290,7 +279,7 @@ impl Handle {
 #[derive(Debug)]
 pub struct SleepFuture {
     tx: channel::Sender<driver::Event>,
-    desc: driver::NodeDesc,
+    timeout: Instant,
     state: SleepState,
 }
 
@@ -306,9 +295,14 @@ pub enum SleepError {
 #[derive(Debug)]
 enum SleepState {
     Pending,
-    Sleeping,
+
+    /// SAFETY: No other thread but worker thread can access this.
+    Sleeping(Arc<WakerCell>),
     Woken,
 }
+
+unsafe impl Sync for SleepState {}
+unsafe impl Send for SleepState {}
 
 impl std::future::Future for SleepFuture {
     type Output = Result<Duration, SleepError>;
@@ -316,18 +310,23 @@ impl std::future::Future for SleepFuture {
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let now = Instant::now();
 
-        if let Some(over) = now.checked_duration_since(self.desc.timeout) {
+        if let Some(over) = now.checked_duration_since(self.timeout) {
             self.state = SleepState::Woken;
             return Poll::Ready(Ok(over));
         }
 
         if matches!(self.state, SleepState::Pending) {
-            let event = driver::Event::SleepUntil(self.desc, cx.waker().clone());
+            let waker = Arc::new(WakerCell::new(cx.waker().clone()));
+            let event = driver::Event::SleepUntil(NodeDesc {
+                timeout: self.timeout,
+                waker: Arc::downgrade(&waker),
+            });
+
             if let Err(_) = self.tx.send(event) {
                 return Poll::Ready(Err(SleepError::Shutdown));
             }
 
-            self.state = SleepState::Sleeping;
+            self.state = SleepState::Sleeping(waker);
         }
 
         Poll::Pending
@@ -336,8 +335,8 @@ impl std::future::Future for SleepFuture {
 
 impl Drop for SleepFuture {
     fn drop(&mut self) {
-        if matches!(self.state, SleepState::Sleeping) {
-            let _ = self.tx.send(driver::Event::Abort(self.desc));
+        if let SleepState::Sleeping(_) = replace(&mut self.state, SleepState::Woken) {
+            let _ = self.tx.send(driver::Event::Abort(self.timeout));
         }
     }
 }
