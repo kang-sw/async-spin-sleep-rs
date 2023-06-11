@@ -185,9 +185,10 @@ mod driver {
                             this: &mut BinaryHeap<Node>,
                             fn_retain: impl FnMut(&Node) -> bool,
                         ) {
+                            let nodes = std::mem::take(this);
                             let mut vec = nodes.into_vec();
                             vec.retain(fn_retain);
-                            nodes = BinaryHeap::from(vec);
+                            *this = BinaryHeap::from(vec);
                         }
 
                         retain(&mut nodes, fn_retain);
