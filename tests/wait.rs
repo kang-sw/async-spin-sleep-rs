@@ -22,19 +22,15 @@ async fn discard_half() {
     let handle = init.handle();
 
     std::thread::spawn(move || init.execute());
-    for sleep in join_all(
-        (0..100)
-            .rev()
-            .map(|i| handle.sleep_for(std::time::Duration::from_micros(i) * 150))
-            .enumerate()
-            .map(|x| async move {
-                if x.0 % 2 == 0 {
-                    Some(x.1.await)
-                } else {
-                    None
-                }
-            }),
-    )
+    for sleep in join_all((0..100).rev().map(|i| {
+        let handle = handle.clone();
+        async move {
+            tokio::select! {
+              a = handle.sleep_for(std::time::Duration::from_micros(i) * 150) => a,
+              b = handle.sleep_for(std::time::Duration::from_micros(i) * 300) => b,
+            }
+        }
+    }))
     .await
     {
         println!("{sleep:?}");
