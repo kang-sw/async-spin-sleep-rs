@@ -2,12 +2,14 @@
 name = "async-spin-sleep"
 version = "0.1.0"
 edition = "2021"
+description = "A crate providing a highly accurate asynchronous timer for multiple async tasks using spin sleep in a single thread."
 repository = "https://github.com/kang-sw/async-spin-sleep-rs"
 authors = [
     "Stephen Kang(swkang@pxscope.com)",
     "Seungwoo Kang(ki6080@gmail.com)",
 ]
 license = "MIT"
+categories = ["async", "sleep"]
 
 [dependencies]
 parking_lot = "0.12"
