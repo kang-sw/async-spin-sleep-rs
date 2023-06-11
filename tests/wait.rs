@@ -37,18 +37,52 @@ async fn verify_channel_size() {
 
 #[tokio::test]
 async fn discard_test() {
-    discard(500).await;
-    discard(1000).await;
-    discard(2000).await;
-    discard(4000).await;
-    discard(8000).await;
+    discard::<2>(500).await;
+    discard::<2>(1000).await;
+    discard::<2>(2000).await;
+    discard::<2>(4000).await;
+    discard::<2>(8000).await;
+
+    println!("--------------------------------------------------");
+
+    discard::<3>(500).await;
+    discard::<3>(1000).await;
+    discard::<3>(2000).await;
+    discard::<3>(4000).await;
+    discard::<3>(8000).await;
+
+    println!("--------------------------------------------------");
+
+    discard::<4>(500).await;
+    discard::<4>(1000).await;
+    discard::<4>(2000).await;
+    discard::<4>(4000).await;
+    discard::<4>(8000).await;
+
+    println!("--------------------------------------------------");
+
+    discard::<5>(500).await;
+    discard::<5>(1000).await;
+    discard::<5>(2000).await;
+    discard::<5>(4000).await;
+    discard::<5>(8000).await;
+
+    println!("--------------------------------------------------");
+
+    discard::<12>(500).await;
+    discard::<12>(1000).await;
+    discard::<12>(2000).await;
+    discard::<12>(4000).await;
+    discard::<12>(8000).await;
+
+    println!("--------------------------------------------------");
 }
 
-async fn discard(gc: usize) {
+async fn discard<const D: usize>(gc: usize) {
     let mut init = async_spin_sleep::Builder::default();
     init.collect_garbage_at = gc;
 
-    let (handle, driver) = init.build();
+    let (handle, driver) = init.build_d_ary::<D>();
     std::thread::spawn(driver);
 
     let times = futures::future::join_all((0..10000).rev().map(|i| {
@@ -79,7 +113,7 @@ async fn discard(gc: usize) {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn multiple_threads() {
-    let (handle, driver) = async_spin_sleep::create();
+    let (handle, driver) = async_spin_sleep::create_d_ary::<4>();
     std::thread::spawn(driver);
 
     let tasks = (0..10000).rev().map(|i| {

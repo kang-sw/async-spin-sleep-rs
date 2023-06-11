@@ -79,6 +79,10 @@ impl Default for Builder {
 
 impl Builder {
     pub fn build(self) -> (Handle, impl FnOnce()) {
+        self.build_d_ary::<2>()
+    }
+
+    pub fn build_d_ary<const D: usize>(self) -> (Handle, impl FnOnce()) {
         let (tx, rx) = if let Some(cap) = self.channel_capacity {
             channel::bounded(cap)
         } else {
@@ -86,7 +90,7 @@ impl Builder {
         };
 
         let handle = Handle { tx: tx.clone() };
-        let driver = move || driver::execute(self, rx);
+        let driver = move || driver::execute::<D>(self, rx);
 
         (handle, driver)
     }
@@ -96,11 +100,16 @@ pub fn create() -> (Handle, impl FnOnce()) {
     Builder::default().build()
 }
 
+pub fn create_d_ary<const D: usize>() -> (Handle, impl FnOnce()) {
+    Builder::default().build_d_ary::<D>()
+}
+
 /* ------------------------------------------- Driver ------------------------------------------- */
 mod driver {
-    use std::{cell::UnsafeCell, collections::BinaryHeap, sync::Weak, task::Waker, time::Instant};
+    use std::{cell::UnsafeCell, sync::Weak, task::Waker, time::Instant};
 
     use crossbeam::channel::{self, TryRecvError};
+    use dary_heap::DaryHeap;
     use educe::Educe;
 
     use crate::Builder;
@@ -123,8 +132,8 @@ mod driver {
     /// else
     ///     wait condvar
     /// ```
-    pub(crate) fn execute(this: Builder, rx: channel::Receiver<Event>) {
-        let mut nodes = BinaryHeap::<NodeDesc>::new();
+    pub(crate) fn execute<const D: usize>(this: Builder, rx: channel::Receiver<Event>) {
+        let mut nodes = DaryHeap::<NodeDesc, D>::new();
         let mut n_estimated_garbage = 0usize;
         let mut timeout_cursor = Instant::now();
 
@@ -177,26 +186,10 @@ mod driver {
                         if n_estimated_garbage > this.collect_garbage_at {
                             let fn_retain = |x: &NodeDesc| x.waker.strong_count() > 0;
 
-                            #[rustversion::since(1.70)]
-                            fn retain(
-                                this: &mut BinaryHeap<NodeDesc>,
-                                fn_retain: impl FnMut(&NodeDesc) -> bool,
-                            ) {
-                                this.retain(fn_retain);
-                            }
+                            let mut vec = nodes.into_vec();
+                            vec.retain(fn_retain);
+                            nodes = DaryHeap::from(vec);
 
-                            #[rustversion::before(1.70)]
-                            fn retain(
-                                this: &mut BinaryHeap<NodeDesc>,
-                                fn_retain: impl FnMut(&NodeDesc) -> bool,
-                            ) {
-                                let nodes = std::mem::take(this);
-                                let mut vec = nodes.into_vec();
-                                vec.retain(fn_retain);
-                                *this = BinaryHeap::from(vec);
-                            }
-
-                            retain(&mut nodes, fn_retain);
                             n_estimated_garbage = 0;
                         }
                     }
