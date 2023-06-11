@@ -55,7 +55,7 @@ pub struct Init {
     /// Aborted nodes that are too far from execution may remain in the driver's memory for a long
     /// time. This value specifies the maximum number of aborted nodes that can be stored in the
     /// driver's memory. If this value is exceeded, the driver will collect garbage.
-    #[builder(default = 10000)]
+    #[builder(default = 128)]
     pub collect_garbage_at: usize,
 
     // For internal use
@@ -172,15 +172,25 @@ mod driver {
                             }
                         };
 
-                        #[cfg(feature = "bheap-retain")]
-                        nodes.retain(fn_retain);
+                        #[rustversion::since(1.70)]
+                        fn retain(
+                            this: &mut BinaryHeap<Node>,
+                            fn_retain: impl FnMut(&Node) -> bool,
+                        ) {
+                            this.retain(fn_retain);
+                        }
 
-                        #[cfg(not(feature = "bheap-retain"))]
-                        {
+                        #[rustversion::before(1.70)]
+                        fn retain(
+                            this: &mut BinaryHeap<Node>,
+                            fn_retain: impl FnMut(&Node) -> bool,
+                        ) {
                             let mut vec = nodes.into_vec();
                             vec.retain(fn_retain);
                             nodes = BinaryHeap::from(vec);
                         }
+
+                        retain(&mut nodes, fn_retain);
 
                         debug_assert!(n_garbage == 0);
                         debug_assert!(aborts.is_empty());
