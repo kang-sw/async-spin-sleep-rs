@@ -24,7 +24,7 @@
 //! // Wait for the sleep future to complete
 //! let result = futures::executor::block_on(sleep_future);
 //! if let Ok(overly) = result {
-//!     println!("Sleep {:?} more than requested", overly);
+//!     println!("Slept {overly:?} more than requested");
 //! } else {
 //!     println!("Sleep error: {:?}", result.err());
 //! }
