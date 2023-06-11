@@ -2,10 +2,12 @@
 name = "async-spin-sleep"
 version = "0.1.0"
 edition = "2021"
-repository = "https://github.com/stephen-pixelscope/async-spin-sleep-rs"
-authors = ["Stephen Kang(swkang@pxscope.com)"]
-
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+repository = "https://github.com/kang-sw/async-spin-sleep-rs"
+authors = [
+    "Stephen Kang(swkang@pxscope.com)",
+    "Seungwoo Kang(ki6080@gmail.com)",
+]
+license = "MIT"
 
 [dependencies]
 parking_lot = "0.12"
