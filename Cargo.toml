@@ -1,0 +1,19 @@
+[package]
+name = "async-spin-sleep"
+version = "0.1.0"
+edition = "2021"
+repository = "https://github.com/stephen-pixelscope/async-spin-sleep-rs"
+authors = ["Stephen Kang(swkang@pxscope.com)"]
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+parking_lot = "0.12"
+typed-builder = "0.14"
+thiserror = "1.0"
+educe = "0.4"
+enum-as-inner = "0.6"
+
+[dev-dependencies]
+tokio = { version = "1.28", features = ["full"] }
+futures = "0.3"
