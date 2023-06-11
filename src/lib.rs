@@ -156,7 +156,7 @@ mod driver {
             };
 
             match event {
-                Event::SleepUntil(node, until) => nodes.push(Node { waker: until, desc: node }),
+                Event::SleepUntil(desc, waker) => nodes.push(Node { waker, desc }),
 
                 Event::Abort(node) if node.timeout > cursor_timeout => {
                     aborts.insert(node.id);
@@ -280,12 +280,15 @@ impl std::future::Future for SleepFuture {
             return Poll::Ready(Ok(over));
         }
 
-        let event = driver::Event::SleepUntil(self.desc, cx.waker().clone());
-        if let Err(_) = self.tx.send(event) {
-            return Poll::Ready(Err(SleepError::Shutdown));
+        if self.state.is_pending() {
+            let event = driver::Event::SleepUntil(self.desc, cx.waker().clone());
+            if let Err(_) = self.tx.send(event) {
+                return Poll::Ready(Err(SleepError::Shutdown));
+            }
+
+            self.state = SleepState::Sleeping;
         }
 
-        self.state = SleepState::Sleeping;
         Poll::Pending
     }
 }
