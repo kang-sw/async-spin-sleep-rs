@@ -6,18 +6,15 @@
 //! # Example
 //!
 //! ```rust
-//! use async_spin_sleep::Init;
+//! use async_spin_sleep::Builder;
 //! use std::time::Duration;
 //!
-//! // Initialize the timer driver
-//! let timer = Init::default();
-//!
 //! // Create a handle for sleeping for 1 second
-//! let handle = timer.handle();
+//! let (handle, driver) = Builder::default().build();
 //!
 //! // Spawn the driver on a separate thread.
 //! // The timer will be dropped when all handles are dropped.
-//! std::thread::spawn(move || timer.blocking_execute());
+//! std::thread::spawn(driver);
 //!
 //! let sleep_future = handle.sleep_for(Duration::from_secs(1));
 //!
@@ -31,12 +28,12 @@
 //! ```
 use std::{
     pin::Pin,
-    sync::{atomic::AtomicUsize, mpsc},
+    sync::atomic::AtomicUsize,
     task::{Context, Poll},
     time::{Duration, Instant},
 };
 
-use enum_as_inner::EnumAsInner;
+use crossbeam::channel;
 
 /* -------------------------------------------- Init -------------------------------------------- */
 #[cfg(windows)]
@@ -44,56 +41,71 @@ const DEFAULT_SCHEDULE_RESOLUTION: Duration = Duration::from_millis(33);
 #[cfg(unix)]
 const DEFAULT_SCHEDULE_RESOLUTION: Duration = Duration::from_millis(3);
 
-#[derive(Debug, typed_builder::TypedBuilder)]
-pub struct Init {
+#[derive(Debug)]
+pub struct Builder {
     /// Default scheduling resolution for this driver. Setting this to a lower value may decrease
     /// CPU usage of the driver, but may also dangerously increase the chance of missing a wakeup
-    /// event.
-    #[builder(default = DEFAULT_SCHEDULE_RESOLUTION)]
+    /// event due to the OS scheduler.
     pub schedule_resolution: Duration,
 
     /// Aborted nodes that are too far from execution may remain in the driver's memory for a long
     /// time. This value specifies the maximum number of aborted nodes that can be stored in the
     /// driver's memory. If this value is exceeded, the driver will collect garbage.
-    #[builder(default = 128)]
     pub collect_garbage_at: usize,
 
-    // For internal use
-    #[builder(default = Some(mpsc::channel()), setter(skip))]
-    channel: Option<(mpsc::Sender<driver::Event>, mpsc::Receiver<driver::Event>)>,
+    /// Set channel capacity. This value is used to initialize the channel that connects the driver
+    /// and its handles. If the channel is full, the driver will block until the channel is
+    /// available.
+    ///
+    /// When [`None`] is specified, an unbounded channel will be used.
+    pub channel_capacity: Option<usize>,
+
+    // Force 'default' only
+    _0: (),
 }
 
-impl Default for Init {
+impl Default for Builder {
     fn default() -> Self {
-        Self::builder().build()
+        Self {
+            schedule_resolution: DEFAULT_SCHEDULE_RESOLUTION,
+            collect_garbage_at: 128,
+            channel_capacity: None,
+            _0: (),
+        }
     }
 }
 
-impl Init {
-    /// Creates a handle to the timer driver.
-    pub fn handle(&self) -> Handle {
-        Handle { tx: self.channel.as_ref().unwrap().0.clone() }
-    }
+impl Builder {
+    pub fn build(self) -> (Handle, impl FnOnce()) {
+        let (tx, rx) = if let Some(cap) = self.channel_capacity {
+            channel::bounded(cap)
+        } else {
+            channel::unbounded()
+        };
 
-    /// Blocks current thread, executing the driver.
-    pub fn blocking_execute(mut self) {
-        let (_, rx) = self.channel.take().unwrap();
-        driver::execute(self, rx)
+        let handle = Handle { tx: tx.clone() };
+        let driver = move || driver::execute(self, rx);
+
+        (handle, driver)
     }
+}
+
+pub fn create() -> (Handle, impl FnOnce()) {
+    Builder::default().build()
 }
 
 /* ------------------------------------------- Driver ------------------------------------------- */
 mod driver {
     use std::{
         collections::{BTreeSet, BinaryHeap},
-        sync::mpsc::{self, TryRecvError},
         task::Waker,
         time::Instant,
     };
 
+    use crossbeam::channel::{self, TryRecvError};
     use educe::Educe;
 
-    use crate::Init;
+    use crate::Builder;
 
     #[derive(Debug)]
     pub(crate) enum Event {
@@ -111,7 +123,7 @@ mod driver {
     /// else
     ///     wait condvar
     /// ```
-    pub(crate) fn execute(this: Init, rx: mpsc::Receiver<Event>) {
+    pub(crate) fn execute(this: Builder, rx: channel::Receiver<Event>) {
         let mut nodes = BinaryHeap::<Node>::new();
         let mut aborts = BTreeSet::<usize>::new();
         let mut n_garbage = 0usize;
@@ -120,7 +132,7 @@ mod driver {
         'outer: loop {
             let now = Instant::now();
 
-            let event = if let Some(node) = nodes.peek() {
+            let mut event = if let Some(node) = nodes.peek() {
                 let remain = node.desc.timeout.saturating_duration_since(now);
                 if remain > this.schedule_resolution {
                     let system_sleep_for = remain - this.schedule_resolution;
@@ -155,50 +167,65 @@ mod driver {
                 x
             };
 
-            match event {
-                Event::SleepUntil(desc, waker) => nodes.push(Node { waker, desc }),
+            loop {
+                match event {
+                    Event::SleepUntil(desc, waker) => nodes.push(Node { waker, desc }),
 
-                Event::Abort(node) if node.timeout > cursor_timeout => {
-                    aborts.insert(node.id);
-                    n_garbage += 1;
+                    Event::Abort(node) if node.timeout > cursor_timeout => {
+                        aborts.insert(node.id);
+                        n_garbage += 1;
 
-                    if n_garbage > this.collect_garbage_at {
-                        let fn_retain = |x: &Node| {
-                            if let Some(_) = aborts.take(&x.desc.id) {
-                                n_garbage -= 1;
-                                false
-                            } else {
-                                true
+                        if n_garbage > this.collect_garbage_at {
+                            let fn_retain = |x: &Node| {
+                                if let Some(_) = aborts.take(&x.desc.id) {
+                                    n_garbage -= 1;
+                                    false
+                                } else {
+                                    true
+                                }
+                            };
+
+                            #[rustversion::since(1.70)]
+                            fn retain(
+                                this: &mut BinaryHeap<Node>,
+                                fn_retain: impl FnMut(&Node) -> bool,
+                            ) {
+                                this.retain(fn_retain);
                             }
-                        };
 
-                        #[rustversion::since(1.70)]
-                        fn retain(
-                            this: &mut BinaryHeap<Node>,
-                            fn_retain: impl FnMut(&Node) -> bool,
-                        ) {
-                            this.retain(fn_retain);
+                            #[rustversion::before(1.70)]
+                            fn retain(
+                                this: &mut BinaryHeap<Node>,
+                                fn_retain: impl FnMut(&Node) -> bool,
+                            ) {
+                                let nodes = std::mem::take(this);
+                                let mut vec = nodes.into_vec();
+                                vec.retain(fn_retain);
+                                *this = BinaryHeap::from(vec);
+                            }
+
+                            retain(&mut nodes, fn_retain);
+
+                            debug_assert_eq!(
+                                n_garbage,
+                                0,
+                                "grabages: {:?}, nodes: {:?}",
+                                aborts.len(),
+                                nodes.len()
+                            );
+                            debug_assert!(aborts.is_empty());
                         }
-
-                        #[rustversion::before(1.70)]
-                        fn retain(
-                            this: &mut BinaryHeap<Node>,
-                            fn_retain: impl FnMut(&Node) -> bool,
-                        ) {
-                            let nodes = std::mem::take(this);
-                            let mut vec = nodes.into_vec();
-                            vec.retain(fn_retain);
-                            *this = BinaryHeap::from(vec);
-                        }
-
-                        retain(&mut nodes, fn_retain);
-
-                        debug_assert!(n_garbage == 0);
-                        debug_assert!(aborts.is_empty());
                     }
-                }
 
-                Event::Abort(_) => (), // It is safe to ignore.
+                    Event::Abort(_) => (), // It is safe to ignore.
+                };
+
+                // Consume all events in the channel.
+                match rx.try_recv() {
+                    Ok(x) => event = x,
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => break 'outer,
+                }
             }
         }
     }
@@ -231,7 +258,7 @@ mod driver {
 /* ------------------------------------------- Handle ------------------------------------------- */
 #[derive(Debug, Clone)]
 pub struct Handle {
-    tx: mpsc::Sender<driver::Event>,
+    tx: channel::Sender<driver::Event>,
 }
 
 impl Handle {
@@ -262,10 +289,13 @@ impl Handle {
 /* ------------------------------------------- Future ------------------------------------------- */
 #[derive(Debug)]
 pub struct SleepFuture {
-    tx: mpsc::Sender<driver::Event>,
+    tx: channel::Sender<driver::Event>,
     desc: driver::NodeDesc,
     state: SleepState,
 }
+
+#[cfg(test)]
+static_assertions::assert_impl_all!(SleepFuture: Send, Sync, Unpin);
 
 #[derive(Debug, thiserror::Error)]
 pub enum SleepError {
@@ -273,7 +303,7 @@ pub enum SleepError {
     Shutdown,
 }
 
-#[derive(Debug, EnumAsInner)]
+#[derive(Debug)]
 enum SleepState {
     Pending,
     Sleeping,
@@ -291,7 +321,7 @@ impl std::future::Future for SleepFuture {
             return Poll::Ready(Ok(over));
         }
 
-        if self.state.is_pending() {
+        if matches!(self.state, SleepState::Pending) {
             let event = driver::Event::SleepUntil(self.desc, cx.waker().clone());
             if let Err(_) = self.tx.send(event) {
                 return Poll::Ready(Err(SleepError::Shutdown));
@@ -306,7 +336,7 @@ impl std::future::Future for SleepFuture {
 
 impl Drop for SleepFuture {
     fn drop(&mut self) {
-        if self.state.is_sleeping() {
+        if matches!(self.state, SleepState::Sleeping) {
             let _ = self.tx.send(driver::Event::Abort(self.desc));
         }
     }

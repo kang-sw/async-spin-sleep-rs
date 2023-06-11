@@ -14,21 +14,15 @@ async-spin-sleep = "{choose-version-here}"
 Then, in your Rust code, you can use it as follows:
 
 ```rust
-use async_spin_sleep::{Init, join_all};
+let (handle, exec) = async_spin_sleep::create();
+std::thread::spawn(exec);
 
-#[tokio::main]
-async fn main() {
-    let init = Init::default();
-    let handle = init.handle();
-
-    std::thread::spawn(move || init.blocking_execute());
-    for sleep in join_all(
-        (0..100).rev().map(|i| handle.sleep_for(std::time::Duration::from_micros(i) * 150)),
-    )
-    .await
-    {
-        println!("{sleep:?}");
-    }
+for sleep in futures::future::join_all(
+    (0..100).rev().map(|i| handle.sleep_for(std::time::Duration::from_micros(i) * 150)),
+)
+.await
+{
+    println!("{sleep:?}");
 }
 ```
 

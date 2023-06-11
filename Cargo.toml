@@ -1,6 +1,6 @@
 [package]
 name = "async-spin-sleep"
-version = "0.2.2"
+version = "0.3.0"
 edition = "2021"
 description = "A crate providing a highly accurate asynchronous timer for multiple async tasks using spin sleep in a single thread."
 repository = "https://github.com/kang-sw/async-spin-sleep-rs"
@@ -12,12 +12,12 @@ license = "MIT"
 keywords = ["async", "sleep"]
 
 [dependencies]
-typed-builder = "0.14"
 thiserror = "1.0"
 educe = "0.4"
-enum-as-inner = "0.6"
 rustversion = "1.0"
+crossbeam = "0.8"
 
 [dev-dependencies]
 tokio = { version = "1.28", features = ["full"] }
 futures = "0.3"
+static_assertions = "1"
