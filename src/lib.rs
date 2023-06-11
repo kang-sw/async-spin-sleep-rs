@@ -141,14 +141,13 @@ mod driver {
                             }
                         };
 
-                        #[cfg(not(feature = "no-bheap-retain"))]
+                        #[cfg(feature = "bheap-retain")]
                         nodes.retain(fn_retain);
 
-                        #[cfg(feature = "no-bheap-retain")]
+                        #[cfg(not(feature = "bheap-retain"))]
                         {
                             let mut vec = nodes.into_vec();
                             vec.retain(fn_retain);
-
                             nodes = BinaryHeap::from(vec);
                         }
 
