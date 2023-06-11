@@ -106,7 +106,12 @@ pub fn create_d_ary<const D: usize>() -> (Handle, impl FnOnce()) {
 
 /* ------------------------------------------- Driver ------------------------------------------- */
 mod driver {
-    use std::{cell::UnsafeCell, sync::Weak, task::Waker, time::Instant};
+    use std::{
+        cell::UnsafeCell,
+        sync::Weak,
+        task::Waker,
+        time::{Duration, Instant},
+    };
 
     use crossbeam::channel::{self, TryRecvError};
     use dary_heap::DaryHeap;
@@ -133,23 +138,27 @@ mod driver {
     ///     wait condvar
     /// ```
     pub(crate) fn execute<const D: usize>(this: Builder, rx: channel::Receiver<Event>) {
-        let mut nodes = DaryHeap::<NodeDesc, D>::new();
+        let mut nodes = DaryHeap::<Node, D>::new();
         let mut n_estimated_garbage = 0usize;
-        let mut timeout_cursor = Instant::now();
+        let pivot = Instant::now();
+        let to_usec = |x: Instant| x.duration_since(pivot).as_micros() as u64;
+        let resolution_usec = this.schedule_resolution.as_micros() as u64;
+
+        let mut timeout_cursor = to_usec(Instant::now());
 
         'outer: loop {
-            let now = Instant::now();
+            let now = to_usec(Instant::now());
 
             let mut event = if let Some(node) = nodes.peek() {
-                let remain = node.timeout.saturating_duration_since(now);
-                if remain > this.schedule_resolution {
-                    let system_sleep_for = remain - this.schedule_resolution;
-                    let Ok(x) = rx.recv_timeout(system_sleep_for) else { continue };
+                let remain = node.timeout_usec.saturating_sub(now);
+                if remain > resolution_usec {
+                    let system_sleep_for = remain - resolution_usec;
+                    let Ok(x) = rx.recv_timeout(Duration::from_micros( system_sleep_for)) else { continue };
                     x
                 } else {
                     loop {
-                        let now = Instant::now();
-                        if now >= node.timeout {
+                        let now = to_usec(Instant::now());
+                        if now >= node.timeout_usec {
                             // This is the only point where a node is executed.
                             let node = nodes.pop().unwrap();
 
@@ -160,7 +169,7 @@ mod driver {
                                 n_estimated_garbage = n_estimated_garbage.saturating_sub(1);
                             }
 
-                            timeout_cursor = node.timeout;
+                            timeout_cursor = node.timeout_usec;
                             continue 'outer;
                         } else {
                             match rx.try_recv() {
@@ -178,13 +187,15 @@ mod driver {
 
             loop {
                 match event {
-                    Event::SleepUntil(desc) => nodes.push(desc),
+                    Event::SleepUntil(desc) => {
+                        nodes.push(Node { timeout_usec: to_usec(desc.timeout), waker: desc.waker })
+                    }
 
-                    Event::Abort(timeout) if timeout > timeout_cursor => {
+                    Event::Abort(timeout) if to_usec(timeout) > timeout_cursor => {
                         n_estimated_garbage += 1;
 
                         if n_estimated_garbage > this.collect_garbage_at {
-                            let fn_retain = |x: &NodeDesc| x.waker.strong_count() > 0;
+                            let fn_retain = |x: &Node| x.waker.strong_count() > 0;
 
                             let mut vec = nodes.into_vec();
                             vec.retain(fn_retain);
@@ -207,21 +218,27 @@ mod driver {
         }
     }
 
+    #[derive(Debug, Clone)]
+    pub(crate) struct NodeDesc {
+        pub timeout: Instant,
+        pub waker: Weak<WakerCell>,
+    }
+
     #[derive(Debug, Clone, Educe)]
     #[educe(Eq, PartialEq, PartialOrd, Ord)]
-    pub(crate) struct NodeDesc {
+    pub(crate) struct Node {
         #[educe(PartialOrd(method = "cmp_rev_partial"), Ord(method = "cmp_rev"))]
-        pub timeout: Instant,
+        pub timeout_usec: u64,
 
         #[educe(Eq(ignore), PartialEq(ignore), PartialOrd(ignore), Ord(ignore))]
         pub waker: Weak<WakerCell>,
     }
 
-    fn cmp_rev(a: &Instant, b: &Instant) -> std::cmp::Ordering {
+    fn cmp_rev(a: &u64, b: &u64) -> std::cmp::Ordering {
         b.cmp(a)
     }
 
-    fn cmp_rev_partial(a: &Instant, b: &Instant) -> Option<std::cmp::Ordering> {
+    fn cmp_rev_partial(a: &u64, b: &u64) -> Option<std::cmp::Ordering> {
         b.partial_cmp(a)
     }
 
