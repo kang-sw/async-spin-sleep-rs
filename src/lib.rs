@@ -29,7 +29,7 @@
 use std::{
     mem::replace,
     pin::Pin,
-    sync::Arc,
+    sync::{atomic::{AtomicIsize, Ordering}, Arc},
     task::{Context, Poll},
     time::{Duration, Instant},
 };
@@ -62,6 +62,24 @@ pub struct Builder {
     /// When [`None`] is specified, an unbounded channel will be used.
     pub channel_capacity: Option<usize>,
 
+    /// A shared handle to represent naive number of garbage nodes to collect
+    ///
+    /// # How it works
+    ///
+    /// [future]
+    /// 1. node is aborted
+    /// 2. downgrade handle
+    ///     - if node is alive -> worker already locked the weak handle, thus we don't touch
+    ///       the `gc_count`, as the server is going to call waker
+    ///     - if node dead -> worker didn't lock the weak handle, it may persist in the queue. thus
+    ///       we should increment `gc_count`
+    ///
+    /// [worker]
+    /// - on every new node insertion, check if `gc_count` is greater than `collect_garbage_at`
+    /// - on node execution, try to lock the handle, and if it fails, decrement `gc_count` and
+    ///   consume the node.
+    gc_counter: Arc<AtomicIsize>,
+
     // Force 'default' only
     _0: (),
 }
@@ -72,6 +90,7 @@ impl Default for Builder {
             schedule_resolution: DEFAULT_SCHEDULE_RESOLUTION,
             collect_garbage_at: 1000,
             channel_capacity: None,
+            gc_counter: Default::default(),
             _0: (),
         }
     }
@@ -89,7 +108,7 @@ impl Builder {
             channel::unbounded()
         };
 
-        let handle = Handle { tx: tx.clone() };
+        let handle = Handle { tx: tx.clone(), gc_counter: self.gc_counter.clone() };
         let driver = move || driver::execute::<D>(self, rx);
 
         (handle, driver)
@@ -108,7 +127,7 @@ pub fn create_d_ary<const D: usize>() -> (Handle, impl FnOnce()) {
 mod driver {
     use std::{
         cell::UnsafeCell,
-        sync::Weak,
+        sync::{atomic::Ordering::{Relaxed, self}, Weak},
         task::Waker,
         time::{Duration, Instant},
     };
@@ -122,9 +141,6 @@ mod driver {
     #[derive(Debug)]
     pub(crate) enum Event {
         SleepUntil(NodeDesc),
-
-        /// The second argument enforces sequential execution of all commands
-        Abort(Instant),
     }
 
     /// ```plain
@@ -139,12 +155,10 @@ mod driver {
     /// ```
     pub(crate) fn execute<const D: usize>(this: Builder, rx: channel::Receiver<Event>) {
         let mut nodes = DaryHeap::<Node, D>::new();
-        let mut n_estimated_garbage = 0usize;
         let pivot = Instant::now();
         let to_usec = |x: Instant| x.duration_since(pivot).as_micros() as u64;
         let resolution_usec = this.schedule_resolution.as_micros() as u64;
-
-        let mut timeout_cursor = to_usec(Instant::now());
+        let gc_counter = this.gc_counter;
 
         'outer: loop {
             let now = to_usec(Instant::now());
@@ -159,60 +173,58 @@ mod driver {
                     loop {
                         let now = to_usec(Instant::now());
                         if now >= node.timeout_usec {
-                            // This is the only point where a node is executed.
                             let node = nodes.pop().unwrap();
 
-                            if let Some(waker) = node.waker.upgrade() {
+                            if let Some(waker) = node.weak_waker.upgrade() {
                                 // SAFETY: No other thread access value of this pointer.
                                 unsafe { (*waker.get()).take().unwrap().wake() }
                             } else {
-                                n_estimated_garbage = n_estimated_garbage.saturating_sub(1);
+                                gc_counter.fetch_sub(1, Ordering::AcqRel);
                             }
 
-                            timeout_cursor = node.timeout_usec;
                             continue 'outer;
                         } else {
                             match rx.try_recv() {
                                 Ok(x) => break x,
-                                Err(TryRecvError::Empty) => std::thread::yield_now(),
-                                Err(TryRecvError::Disconnected) => break 'outer,
+                                Err(TryRecvError::Disconnected) if nodes.is_empty() => break 'outer,
+                                Err(TryRecvError::Disconnected) | Err(TryRecvError::Empty) => {
+                                    std::thread::yield_now()
+                                }
                             }
                         }
                     }
                 }
             } else {
-                let Ok(x) = rx.recv() else { break };
+                let Ok(x) = rx.recv() else { 
+                    break 
+                };
                 x
             };
+
+            if gc_counter.load(Ordering::Acquire) as usize > this.collect_garbage_at {
+                let fn_retain = |x: &Node| x.weak_waker.strong_count() > 0;
+
+                let mut vec = nodes.into_vec();
+                let num_total = vec.len();
+                vec.retain(fn_retain);
+                nodes = DaryHeap::from(vec);
+
+                let n_collected = num_total - nodes.len();
+                gc_counter.fetch_sub(n_collected as _, Ordering::AcqRel);
+            }
 
             loop {
                 match event {
                     Event::SleepUntil(desc) => {
-                        nodes.push(Node { timeout_usec: to_usec(desc.timeout), waker: desc.waker })
+                        nodes.push(Node { timeout_usec: to_usec(desc.timeout), weak_waker: desc.waker })
                     }
-
-                    Event::Abort(timeout) if to_usec(timeout) > timeout_cursor => {
-                        n_estimated_garbage += 1;
-
-                        if n_estimated_garbage > this.collect_garbage_at {
-                            let fn_retain = |x: &Node| x.waker.strong_count() > 0;
-
-                            let mut vec = nodes.into_vec();
-                            vec.retain(fn_retain);
-                            nodes = DaryHeap::from(vec);
-
-                            n_estimated_garbage = 0;
-                        }
-                    }
-
-                    Event::Abort(_) => (),
                 };
 
                 // Consume all events in the channel.
                 match rx.try_recv() {
                     Ok(x) => event = x,
-                    Err(TryRecvError::Empty) => break,
-                    Err(TryRecvError::Disconnected) => break 'outer,
+                    Err(TryRecvError::Disconnected) if nodes.is_empty() => break 'outer,
+                    Err(TryRecvError::Disconnected) | Err(TryRecvError::Empty) => break,
                 }
             }
         }
@@ -231,7 +243,7 @@ mod driver {
         pub timeout_usec: u64,
 
         #[educe(Eq(ignore), PartialEq(ignore), PartialOrd(ignore), Ord(ignore))]
-        pub waker: Weak<WakerCell>,
+        pub weak_waker: Weak<WakerCell>,
     }
 
     fn cmp_rev(a: &u64, b: &u64) -> std::cmp::Ordering {
@@ -243,7 +255,11 @@ mod driver {
     }
 
     #[derive(Debug)]
-    pub(crate) struct WakerCell(UnsafeCell<Option<Waker>>);
+    pub(crate) struct WakerCell {
+        // SAFETY: This UnsafeCell is only used to take the value of the waker.
+        //  dsa sads
+        waker: UnsafeCell<Option<Waker>>,
+    }
 
     unsafe impl Sync for WakerCell {}
     unsafe impl Send for WakerCell {}
@@ -252,13 +268,13 @@ mod driver {
         type Target = UnsafeCell<Option<Waker>>;
 
         fn deref(&self) -> &Self::Target {
-            &self.0
+            &self.waker
         }
     }
 
     impl WakerCell {
         pub fn new(waker: Waker) -> Self {
-            Self(UnsafeCell::new(Some(waker)))
+            Self { waker: UnsafeCell::new(Some(waker)) }
         }
     }
 }
@@ -267,6 +283,7 @@ mod driver {
 #[derive(Debug, Clone)]
 pub struct Handle {
     tx: channel::Sender<driver::Event>,
+    gc_counter: Arc<AtomicIsize>,
 }
 
 impl Handle {
@@ -281,7 +298,12 @@ impl Handle {
     ///
     /// [`SleepFuture`] returns the duration that overly passed the specified instant.
     pub fn sleep_until(&self, timeout: Instant) -> SleepFuture {
-        SleepFuture { tx: self.tx.clone(), state: SleepState::Pending, timeout }
+        SleepFuture {
+            tx: self.tx.clone(),
+            state: SleepState::Pending,
+            timeout,
+            gc_counter: self.gc_counter.clone(),
+        }
     }
 }
 
@@ -289,6 +311,7 @@ impl Handle {
 #[derive(Debug)]
 pub struct SleepFuture {
     tx: channel::Sender<driver::Event>,
+    gc_counter: Arc<AtomicIsize>,
     timeout: Instant,
     state: SleepState,
 }
@@ -345,8 +368,14 @@ impl std::future::Future for SleepFuture {
 
 impl Drop for SleepFuture {
     fn drop(&mut self) {
-        if let SleepState::Sleeping(_) = replace(&mut self.state, SleepState::Woken) {
-            let _ = self.tx.send(driver::Event::Abort(self.timeout));
+        if let SleepState::Sleeping(n) = replace(&mut self.state, SleepState::Woken) {
+            if let Some(_) = Arc::into_inner(n) {
+                // okay, we got the last reference, server is guaranteed to decrement the gc_counter.
+                self.gc_counter.fetch_add(1, Ordering::AcqRel);
+            } else {
+                // otherwise, server got the last reference, thus gc_counter won't be decremented.
+                // so we don't touch this here either.
+            }
         }
     }
 }
