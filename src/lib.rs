@@ -130,10 +130,7 @@ pub fn create_d_ary<const D: usize>() -> (Handle, impl FnOnce()) {
 mod driver {
     use std::{
         cell::UnsafeCell,
-        sync::{
-            atomic::Ordering::{self, Relaxed},
-            Weak,
-        },
+        sync::{atomic::Ordering, Weak},
         task::Waker,
         time::{Duration, Instant},
     };
