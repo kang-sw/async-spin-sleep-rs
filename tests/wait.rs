@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[tokio::test]
 async fn verify_unbounded() {
@@ -136,4 +136,40 @@ async fn multiple_threads() {
     let avg = times.into_iter().map(|x| x.unwrap()).sum::<Duration>() / len as u32;
 
     println!("avg: {:?}", avg);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn interval() {
+    let (handle, driver) = async_spin_sleep::create_d_ary::<4>();
+    std::thread::spawn(driver);
+
+    let interval = Duration::from_micros(1500);
+    let tolerance = Duration::from_micros(300);
+    let interval_ns = interval.as_nanos() as i128;
+    let mut obj = handle.interval(interval);
+    obj.align_with_system_clock(0., interval, tolerance);
+
+    let mut offset = 0.;
+    let mut acc_error = 0.;
+    for idx in 0..10000 {
+        let x = obj.wait().await.unwrap();
+
+        let now_ns = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let mut error_ns = now_ns as i128 % interval_ns;
+        if error_ns > interval_ns / 2 {
+            error_ns -= interval_ns;
+        }
+
+        let error_sec = error_ns as f64 / 1e9;
+        print!("{:?} - {:.1?}us", x, error_sec * 1e6);
+        acc_error = acc_error * 0.98 + error_sec * 0.02;
+
+        if idx % 100 == 99 {
+            offset -= acc_error;
+            obj.align_with_system_clock(offset, interval, tolerance);
+            println!("                                     ");
+        } else {
+            print!("\r");
+        }
+    }
 }

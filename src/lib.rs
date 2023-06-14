@@ -29,7 +29,10 @@
 use std::{
     mem::replace,
     pin::Pin,
-    sync::{atomic::{AtomicIsize, Ordering}, Arc},
+    sync::{
+        atomic::{AtomicIsize, Ordering},
+        Arc,
+    },
     task::{Context, Poll},
     time::{Duration, Instant},
 };
@@ -127,7 +130,10 @@ pub fn create_d_ary<const D: usize>() -> (Handle, impl FnOnce()) {
 mod driver {
     use std::{
         cell::UnsafeCell,
-        sync::{atomic::Ordering::{Relaxed, self}, Weak},
+        sync::{
+            atomic::Ordering::{self, Relaxed},
+            Weak,
+        },
         task::Waker,
         time::{Duration, Instant},
     };
@@ -195,8 +201,8 @@ mod driver {
                     }
                 }
             } else {
-                let Ok(x) = rx.recv() else { 
-                    break 
+                let Ok(x) = rx.recv() else {
+                    break
                 };
                 x
             };
@@ -215,9 +221,8 @@ mod driver {
 
             loop {
                 match event {
-                    Event::SleepUntil(desc) => {
-                        nodes.push(Node { timeout_usec: to_usec(desc.timeout), weak_waker: desc.waker })
-                    }
+                    Event::SleepUntil(desc) => nodes
+                        .push(Node { timeout_usec: to_usec(desc.timeout), weak_waker: desc.waker }),
                 };
 
                 // Consume all events in the channel.
@@ -256,7 +261,7 @@ mod driver {
 
     #[derive(Debug)]
     pub(crate) struct WakerCell {
-        // SAFETY: This UnsafeCell is only used to take the value of the waker.
+        // SAFETY: This UnsafeCell is only used to take the value out of the waker.
         //  dsa sads
         waker: UnsafeCell<Option<Waker>>,
     }
@@ -305,6 +310,153 @@ impl Handle {
             gc_counter: self.gc_counter.clone(),
         }
     }
+
+    pub fn interval(&self, interval: Duration) -> util::Interval {
+        util::Interval { handle: self.clone(), wakeup: Instant::now(), interval }
+    }
+}
+
+pub mod util {
+    use std::time::{Duration, Instant};
+
+    use crate::{instant, SleepResult};
+
+    #[derive(Debug, Clone)]
+    pub struct Interval {
+        pub(crate) handle: super::Handle,
+        pub(crate) wakeup: Instant,
+        pub(crate) interval: Duration,
+    }
+
+    impl Interval {
+        pub async fn wait(&mut self) -> SleepResult {
+            let Self { handle, wakeup: sleep_until, interval } = self;
+
+            let result = handle.sleep_until(*sleep_until).await;
+            let now = Instant::now();
+            *sleep_until = *sleep_until + *interval;
+
+            if now > *sleep_until {
+                // XXX: We use 128 bit integer to avoid overflow in nanosecond domain.
+                //  This is not a perfect solution, but it should be enough for most cases,
+                //  as 'over-sleep' is relatively rare case thus slow path is not a big deal.
+                let interval_ns = interval.as_nanos();
+                let num_ticks = ((now - *sleep_until).as_nanos() - 1) / interval_ns + 1;
+
+                *sleep_until += Duration::from_nanos((interval_ns * num_ticks) as _);
+            }
+
+            result
+        }
+
+        pub fn set_interval(&mut self, interval: Duration) {
+            assert!(interval > Duration::default());
+            self.interval = interval;
+        }
+
+        pub fn interval(&self) -> Duration {
+            self.interval
+        }
+
+        /// Sets next tick at the specified instant. After this point, timestamp will be aligned
+        /// to given instant.
+        pub fn wakeup_at(&mut self, instant: Instant) {
+            self.wakeup = instant;
+        }
+
+        /// Align with
+        ///
+        /// ```no_run
+        /// let handle: Interval = todo!();
+        /// let func = || std::time::SystemTime::now() - std::time::SystemTime::UNIX_EPOCH;
+        /// handle.align_with_clock(func, handle.interval(), Default::default());
+        /// ```
+        pub fn align_with_clock(
+            &mut self,
+            now_time_since_epoch: impl Fn() -> Duration,
+            interval: Duration,
+            early_wakeup_tolerance: Duration,
+        ) {
+            assert!(interval > Duration::default());
+
+            let src_now = instant::time_since_epoch();
+            let src_now_ns = src_now.as_nanos();
+            let dst_now_ns = now_time_since_epoch().as_nanos();
+
+            let interval_ns = interval.as_nanos();
+            let src_now_gap = (src_now_ns % interval_ns) as i64;
+            let dst_now_gap = (dst_now_ns % interval_ns) as i64;
+
+            let mut src_delay_ns = dst_now_gap - src_now_gap;
+            if src_delay_ns < 0 {
+                src_delay_ns += interval_ns as i64;
+            }
+
+            // calculate target alignment timestamp
+            let n_ticks = (src_now_ns / interval_ns).saturating_sub(1); // naively align to previous tick
+            let mut aligned_ts_ns = n_ticks * interval_ns + src_delay_ns as u128;
+
+            let previous_wakeup = self.wakeup.checked_duration_since(instant::origin());
+            if let Some(prev) = previous_wakeup {
+                let tolerance_ns = early_wakeup_tolerance.as_nanos();
+                let prev_ns = prev.as_nanos().saturating_sub(tolerance_ns);
+                if let Some(wait_time_ns) = prev_ns.checked_sub(aligned_ts_ns) {
+                    // we have to trigger *after* previous target alignment,
+                    let n_ticks = wait_time_ns / interval_ns;
+                    aligned_ts_ns += n_ticks * interval_ns;
+                }
+            }
+
+            let aligned_ts = Duration::new(
+                (aligned_ts_ns / 1_000_000_000) as u64,
+                (aligned_ts_ns % 1_000_000_000) as u32,
+            );
+
+            self.wakeup_at(instant::origin() + aligned_ts);
+            self.set_interval(interval);
+        }
+
+        /// Align with system clock. This is a shortcut for [`Interval::align_with_clock`].
+        #[cfg(feature = "interval-align-system")]
+        pub fn align_with_system_clock(
+            &mut self,
+            offset_sec: f64,
+            interval: Duration,
+            early_wakeup_tolerance: Duration,
+        ) {
+            self.align_with_clock(
+                || {
+                    let ts = std::time::SystemTime::now()
+                        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                        .unwrap();
+
+                    if offset_sec >= 0. {
+                        ts + Duration::from_secs_f64(offset_sec)
+                    } else {
+                        ts - Duration::from_secs_f64(-offset_sec)
+                    }
+                },
+                interval,
+                early_wakeup_tolerance,
+            );
+        }
+    }
+}
+
+mod instant {
+    use std::time::{Duration, Instant};
+
+    pub(crate) fn origin() -> Instant {
+        lazy_static::lazy_static!(
+            static ref PIVOT: Instant = Instant::now();
+        );
+
+        *PIVOT
+    }
+
+    pub(crate) fn time_since_epoch() -> Duration {
+        Instant::now() - origin()
+    }
 }
 
 /* ------------------------------------------- Future ------------------------------------------- */
@@ -328,8 +480,6 @@ pub enum SleepError {
 #[derive(Debug)]
 enum SleepState {
     Pending,
-
-    /// SAFETY: No other thread but worker thread can access this.
     Sleeping(Arc<WakerCell>),
     Woken,
 }
@@ -337,8 +487,10 @@ enum SleepState {
 unsafe impl Sync for SleepState {}
 unsafe impl Send for SleepState {}
 
+pub type SleepResult = Result<Duration, SleepError>;
+
 impl std::future::Future for SleepFuture {
-    type Output = Result<Duration, SleepError>;
+    type Output = SleepResult;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let now = Instant::now();
