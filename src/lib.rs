@@ -308,8 +308,10 @@ impl Handle {
         }
     }
 
+    /// Create an interval controller which wakes up after specified `interval` duration on
+    /// every call to [`util::Interval::wait`]
     pub fn interval(&self, interval: Duration) -> util::Interval {
-        util::Interval { handle: self.clone(), wakeup: Instant::now(), interval }
+        util::Interval { handle: self.clone(), wakeup: Instant::now() + interval, interval }
     }
 }
 
@@ -346,8 +348,14 @@ pub mod util {
             result
         }
 
+        /// Reset interval to the specified duration.
+        ///
+        /// > **_warning_** This method will break the alignment set up by [`Self::wakeup_at`].
+        /// > If you want to keep the alignment,
         pub fn set_interval(&mut self, interval: Duration) {
             assert!(interval > Duration::default());
+            self.wakeup -= self.interval;
+            self.wakeup += interval;
             self.interval = interval;
         }
 
@@ -355,8 +363,12 @@ pub mod util {
             self.interval
         }
 
+        pub fn next_wakeup(&self) -> Instant {
+            self.wakeup
+        }
+
         /// Sets next tick at the specified instant. After this point, timestamp will be aligned
-        /// to given instant.
+        /// to given instant. This may break the alignment set up by [`Self::set_interval`].
         pub fn wakeup_at(&mut self, instant: Instant) {
             self.wakeup = instant;
         }
@@ -409,8 +421,8 @@ pub mod util {
                 (aligned_ts_ns % 1_000_000_000) as u32,
             );
 
-            self.wakeup_at(instant::origin() + aligned_ts);
-            self.set_interval(interval);
+            self.wakeup = instant::origin() + aligned_ts;
+            self.interval = interval;
         }
 
         /// Align with system clock. This is a shortcut for [`Interval::align_with_clock`].

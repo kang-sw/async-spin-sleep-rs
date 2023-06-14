@@ -161,7 +161,7 @@ async fn interval() {
         }
 
         let error_sec = error_ns as f64 / 1e9;
-        print!("{:?} - {:.1?}us", x, error_sec * 1e6);
+        print!("overslept {:?} - alignemnt {:.1?}us", x, error_sec * 1e6);
         acc_error = acc_error * 0.98 + error_sec * 0.02;
 
         if idx % 100 == 99 {
