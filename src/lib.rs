@@ -27,7 +27,6 @@
 //! }
 //! ```
 use std::{
-    mem::replace,
     pin::Pin,
     sync::{
         atomic::{AtomicIsize, Ordering},
