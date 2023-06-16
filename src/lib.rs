@@ -161,6 +161,10 @@ mod driver {
         let pivot = Instant::now();
         let to_usec = |x: Instant| x.duration_since(pivot).as_micros() as u64;
         let resolution_usec = this.schedule_resolution.as_micros() as u64;
+
+        // As each node always increment the `gc_counter` by 1 when dropped, and the worker
+        // decrements the number by 1 when a node is cleared, this value is expected to be a naive
+        // state of 'aborted but not yet handled' node count.
         let gc_counter = this.gc_counter;
 
         'outer: loop {
@@ -181,10 +185,9 @@ mod driver {
                             if let Some(waker) = node.weak_waker.upgrade() {
                                 // SAFETY: No other thread access value of this pointer.
                                 unsafe { (*waker.get()).take().unwrap().wake() }
-                            } else {
-                                gc_counter.fetch_sub(1, Ordering::AcqRel);
                             }
 
+                            gc_counter.fetch_sub(1, Ordering::Release);
                             continue 'outer;
                         } else {
                             match rx.try_recv() {
@@ -205,15 +208,15 @@ mod driver {
             };
 
             if gc_counter.load(Ordering::Acquire) as usize > this.collect_garbage_at {
-                let fn_retain = |x: &Node| x.weak_waker.strong_count() > 0;
+                let fn_retain = |x: &Node| x.weak_waker.upgrade().is_some();
 
+                let prev_len = nodes.len();
                 let mut vec = nodes.into_vec();
-                let num_total = vec.len();
                 vec.retain(fn_retain);
                 nodes = DaryHeap::from(vec);
 
-                let n_collected = num_total - nodes.len();
-                gc_counter.fetch_sub(n_collected as _, Ordering::AcqRel);
+                let n_collected = prev_len - nodes.len();
+                gc_counter.fetch_sub(n_collected as _, Ordering::Release);
             }
 
             loop {
@@ -230,6 +233,9 @@ mod driver {
                 }
             }
         }
+
+        assert!(nodes.is_empty());
+        assert_eq!(gc_counter.load(Ordering::Relaxed), 0);
     }
 
     #[derive(Debug, Clone)]
@@ -375,7 +381,7 @@ pub mod util {
 
         /// Align with
         ///
-        /// ```no_run
+        /// ```ignore
         /// let handle: Interval = todo!();
         /// let func = || std::time::SystemTime::now() - std::time::SystemTime::UNIX_EPOCH;
         /// handle.align_with_clock(func, handle.interval(), Default::default());
@@ -505,7 +511,10 @@ impl std::future::Future for SleepFuture {
         let now = Instant::now();
 
         if let Some(over) = now.checked_duration_since(self.timeout) {
-            self.state = SleepState::Woken;
+            if matches!(self.state, SleepState::Sleeping(_)) {
+                self.state = SleepState::Woken;
+            }
+
             return Poll::Ready(Ok(over));
         }
 
@@ -529,14 +538,8 @@ impl std::future::Future for SleepFuture {
 
 impl Drop for SleepFuture {
     fn drop(&mut self) {
-        if let SleepState::Sleeping(n) = replace(&mut self.state, SleepState::Woken) {
-            if let Some(_) = Arc::into_inner(n) {
-                // okay, we got the last reference, server is guaranteed to decrement the gc_counter.
-                self.gc_counter.fetch_add(1, Ordering::AcqRel);
-            } else {
-                // otherwise, server got the last reference, thus gc_counter won't be decremented.
-                // so we don't touch this here either.
-            }
+        if !matches!(&self.state, SleepState::Pending) {
+            self.gc_counter.fetch_add(1, Ordering::Release);
         }
     }
 }

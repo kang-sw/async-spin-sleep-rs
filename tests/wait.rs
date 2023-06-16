@@ -85,7 +85,7 @@ async fn discard<const D: usize>(gc: usize) {
     let (handle, driver) = init.build_d_ary::<D>();
     std::thread::spawn(driver);
 
-    let times = futures::future::join_all((0..10000).rev().map(|i| {
+    let times = futures::future::join_all((0..30000).rev().map(|i| {
         let handle = handle.clone();
         async move {
             tokio::select! {
