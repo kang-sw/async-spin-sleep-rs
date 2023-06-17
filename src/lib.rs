@@ -3,9 +3,6 @@
 //! A dedicated timer driver implementation for easy use of high-precision sleep function in
 //! numerous async/await context.
 //!
-//! ## Usage
-//!
-//!
 //! ## Features
 //!
 //! - *`system-clock`* (default): Enable use of system clock as a timer source.
@@ -29,7 +26,8 @@ const DEFAULT_SCHEDULE_RESOLUTION: Duration = Duration::from_millis(33);
 #[cfg(unix)]
 const DEFAULT_SCHEDULE_RESOLUTION: Duration = Duration::from_millis(3);
 
-#[derive(Debug)]
+#[derive(Debug, derive_setters::Setters)]
+#[setters(prefix = "with_")]
 pub struct Builder {
     /// Default scheduling resolution for this driver. Setting this to a lower value may decrease
     /// CPU usage of the driver, but may also dangerously increase the chance of missing a wakeup
@@ -39,19 +37,22 @@ pub struct Builder {
     /// Aborted nodes that are too far from execution may remain in the driver's memory for a long
     /// time. This value specifies the maximum number of aborted nodes that can be stored in the
     /// driver's memory. If this value is exceeded, the driver will collect garbage.
-    pub collect_garbage_at: usize,
+    pub gc_threshold: usize,
 
     /// Set channel capacity. This value is used to initialize the channel that connects the driver
     /// and its handles. If the channel is full, the driver will block until the channel is
     /// available.
     ///
     /// When [`None`] is specified, an unbounded channel will be used.
+    #[setters(into)]
     pub channel_capacity: Option<usize>,
 
     /// A shared handle to represent naive number of garbage nodes to collect
+    #[setters(skip)]
     gc_counter: Arc<AtomicIsize>,
 
     // Force 'default' only
+    #[setters(skip)]
     _0: (),
 }
 
@@ -59,7 +60,7 @@ impl Default for Builder {
     fn default() -> Self {
         Self {
             schedule_resolution: DEFAULT_SCHEDULE_RESOLUTION,
-            collect_garbage_at: 1000,
+            gc_threshold: 1000,
             channel_capacity: None,
             gc_counter: Default::default(),
             _0: (),
@@ -147,7 +148,7 @@ mod driver {
                             }
 
                             let n_garbage = gc_counter.fetch_sub(1, Ordering::Release);
-                            if n_garbage > this.collect_garbage_at as isize {
+                            if n_garbage > this.gc_threshold as isize {
                                 let n_collect = gc(&mut nodes) as _;
                                 gc_counter.fetch_sub(n_collect, Ordering::Release);
                             }
@@ -174,7 +175,7 @@ mod driver {
                 x
             };
 
-            if gc_counter.load(Ordering::Acquire) as usize > this.collect_garbage_at {
+            if gc_counter.load(Ordering::Acquire) as usize > this.gc_threshold {
                 let n_collect = gc(&mut nodes) as _;
                 gc_counter.fetch_sub(n_collect, Ordering::Release);
             }

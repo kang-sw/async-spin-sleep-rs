@@ -22,9 +22,7 @@ async fn verify_unbounded() {
 
 #[tokio::test]
 async fn verify_channel_size() {
-    let mut args = async_spin_sleep::Builder::default();
-    args.channel_capacity = Some(50);
-
+    let args = async_spin_sleep::Builder::default().with_channel_capacity(50);
     let (handle, driver) = args.build();
     std::thread::spawn(driver);
 
@@ -84,9 +82,7 @@ async fn discard_test() {
 async fn discard<const D: usize>(gc: usize) {
     println!(":: discard<{D}>({gc}) -------------------------------");
 
-    let mut init = async_spin_sleep::Builder::default();
-    init.collect_garbage_at = gc;
-
+    let init = async_spin_sleep::Builder::default().with_gc_threshold(gc);
     let (handle, driver) = init.build_d_ary::<D>();
     std::thread::spawn(driver);
 
