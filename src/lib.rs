@@ -1,31 +1,15 @@
-//! This library provides a timer driver for scheduling and executing timed operations. The driver
-//! allows you to create handles for sleeping for a specific duration or until a specified timeout.
-//! It operates in a concurrent environment and uses a binary heap for efficient scheduling of
-//! events.
+//! # Async-spin-sleep
 //!
-//! # Example
+//! A dedicated timer driver implementation for easy use of high-precision sleep function in
+//! numerous async/await context.
 //!
-//! ```rust
-//! use async_spin_sleep::Builder;
-//! use std::time::Duration;
+//! ## Usage
 //!
-//! // Create a handle for sleeping for 1 second
-//! let (handle, driver) = Builder::default().build();
 //!
-//! // Spawn the driver on a separate thread.
-//! // The timer will be dropped when all handles are dropped.
-//! std::thread::spawn(driver);
+//! ## Features
 //!
-//! let sleep_future = handle.sleep_for(Duration::from_secs(1));
+//! - *`system-clock`* (default): Enable use of system clock as a timer source.
 //!
-//! // Wait for the sleep future to complete
-//! let result = futures::executor::block_on(sleep_future);
-//! if let Ok(overly) = result {
-//!     println!("Slept {overly:?} more than requested");
-//! } else {
-//!     println!("Sleep error: {:?}", result.err());
-//! }
-//! ```
 use std::{
     pin::Pin,
     sync::{
@@ -65,21 +49,6 @@ pub struct Builder {
     pub channel_capacity: Option<usize>,
 
     /// A shared handle to represent naive number of garbage nodes to collect
-    ///
-    /// # How it works
-    ///
-    /// [future]
-    /// 1. node is aborted
-    /// 2. downgrade handle
-    ///     - if node is alive -> worker already locked the weak handle, thus we don't touch
-    ///       the `gc_count`, as the server is going to call waker
-    ///     - if node dead -> worker didn't lock the weak handle, it may persist in the queue. thus
-    ///       we should increment `gc_count`
-    ///
-    /// [worker]
-    /// - on every new node insertion, check if `gc_count` is greater than `collect_garbage_at`
-    /// - on node execution, try to lock the handle, and if it fails, decrement `gc_count` and
-    ///   consume the node.
     gc_counter: Arc<AtomicIsize>,
 
     // Force 'default' only
@@ -145,16 +114,6 @@ mod driver {
         SleepUntil(NodeDesc),
     }
 
-    /// ```plain
-    /// if exists foremost-node
-    ///     if node is far from execution
-    ///         condvar-sleep until safety limit
-    ///         continue
-    ///     else
-    ///         while until foremost-node is executed
-    /// else
-    ///     wait condvar
-    /// ```
     pub(crate) fn execute<const D: usize>(this: Builder, rx: channel::Receiver<Event>) {
         let mut nodes = DaryHeap::<Node, D>::new();
         let pivot = Instant::now();
@@ -163,10 +122,10 @@ mod driver {
 
         // As each node always increment the `gc_counter` by 1 when dropped, and the worker
         // decrements the number by 1 when a node is cleared, this value is expected to be a naive
-        // state of 'aborted but not yet handled' node count.
+        // status of 'aborted but not yet handled' node count, i.e. garbage nodes.
         let gc_counter = this.gc_counter;
 
-        'outer: loop {
+        'outermost: loop {
             let now = to_usec(Instant::now());
 
             let mut event = if let Some(node) = nodes.peek() {
@@ -187,11 +146,13 @@ mod driver {
                             }
 
                             gc_counter.fetch_sub(1, Ordering::Release);
-                            continue 'outer;
+                            continue 'outermost;
                         } else {
                             match rx.try_recv() {
                                 Ok(x) => break x,
-                                Err(TryRecvError::Disconnected) if nodes.is_empty() => break 'outer,
+                                Err(TryRecvError::Disconnected) if nodes.is_empty() => {
+                                    break 'outermost
+                                }
                                 Err(TryRecvError::Disconnected) | Err(TryRecvError::Empty) => {
                                     std::thread::yield_now()
                                 }
@@ -227,7 +188,7 @@ mod driver {
                 // Consume all events in the channel.
                 match rx.try_recv() {
                     Ok(x) => event = x,
-                    Err(TryRecvError::Disconnected) if nodes.is_empty() => break 'outer,
+                    Err(TryRecvError::Disconnected) if nodes.is_empty() => break 'outermost,
                     Err(TryRecvError::Disconnected) | Err(TryRecvError::Empty) => break,
                 }
             }
@@ -316,7 +277,7 @@ impl Handle {
     /// Create an interval controller which wakes up after specified `interval` duration on
     /// every call to [`util::Interval::wait`]
     pub fn interval(&self, interval: Duration) -> util::Interval {
-        util::Interval { handle: self.clone(), wakeup: Instant::now() + interval, interval }
+        util::Interval { handle: self.clone(), wakeup_time: Instant::now() + interval, interval }
     }
 }
 
@@ -328,13 +289,13 @@ pub mod util {
     #[derive(Debug, Clone)]
     pub struct Interval {
         pub(crate) handle: super::Handle,
-        pub(crate) wakeup: Instant,
+        pub(crate) wakeup_time: Instant,
         pub(crate) interval: Duration,
     }
 
     impl Interval {
         pub async fn wait(&mut self) -> SleepResult {
-            let Self { handle, wakeup, interval } = self;
+            let Self { handle, wakeup_time: wakeup, interval } = self;
 
             let result = handle.sleep_until(*wakeup).await;
             let now = Instant::now();
@@ -360,8 +321,8 @@ pub mod util {
         /// > alignment, use [`Self::align_with_clock`] instead.
         pub fn set_interval(&mut self, interval: Duration) {
             assert!(interval > Duration::default());
-            self.wakeup -= self.interval;
-            self.wakeup += interval;
+            self.wakeup_time -= self.interval;
+            self.wakeup_time += interval;
             self.interval = interval;
         }
 
@@ -369,24 +330,38 @@ pub mod util {
             self.interval
         }
 
-        pub fn next_wakeup(&self) -> Instant {
-            self.wakeup
+        pub fn wakeup_time(&self) -> Instant {
+            self.wakeup_time
         }
 
         /// Sets next tick at the specified instant. After this point, timestamp will be aligned
         /// to given instant. This may break the alignment set up by [`Self::set_interval`].
-        pub fn wakeup_at(&mut self, instant: Instant) {
-            self.wakeup = instant;
+        pub fn set_wakeup_time(&mut self, instant: Instant) {
+            self.wakeup_time = instant;
         }
 
-        /// Align with specified clock. This method will align the next tick to the specified
-        /// clock domain with specified interval.
+        /// Align with specified clock. This method will align the next tick to the specified clock
+        /// domain with specified interval.
         ///
         /// ```ignore
         /// let handle: Interval = todo!();
         /// let func = || std::time::SystemTime::now() - std::time::SystemTime::UNIX_EPOCH;
         /// handle.align_with_clock(func, handle.interval(), Default::default());
         /// ```
+        ///
+        /// The next tick will occur after the previously scheduled wakeup timestamp. If the
+        /// provided target timestamp is imprecise, the early_wakeup_tolerance value can be used to
+        /// adjust when it is considered as the wakeup point.
+        ///
+        /// For instance, let's consider a system with an interval of 1000. If the previous wakeup
+        /// happened at 7000, resulting in the next wakeup being set to 8000, and the match request
+        /// occurred at 7997, there is a difference of only 3 between the actual wakeup and the
+        /// match. However, to ensure adherence to the given guarantees, the next tick is scheduled
+        /// after 1000 units, specifically at 8997.
+        ///
+        /// By setting early_wakeup_tolerance to around 100, the next wakeup would be adjusted to
+        /// 7900 instead of 8000. Consequently, the next tick would occur at 7997, maintaining the
+        /// regular interval requirement.
         pub fn align_with_clock(
             &mut self,
             now_time_since_epoch: impl Fn() -> Duration,
@@ -395,9 +370,9 @@ pub mod util {
         ) {
             assert!(interval > Duration::default());
 
+            let dst_now_ns = now_time_since_epoch().as_nanos();
             let src_now = instant::time_since_epoch();
             let src_now_ns = src_now.as_nanos();
-            let dst_now_ns = now_time_since_epoch().as_nanos();
 
             let interval_ns = interval.as_nanos();
             let src_now_gap = (src_now_ns % interval_ns) as i64;
@@ -412,7 +387,7 @@ pub mod util {
             let n_ticks = (src_now_ns / interval_ns).saturating_sub(1); // naively align to previous tick
             let mut aligned_ts_ns = n_ticks * interval_ns + src_delay_ns as u128;
 
-            let previous_wakeup = self.wakeup.checked_duration_since(instant::origin());
+            let previous_wakeup = self.wakeup_time.checked_duration_since(instant::origin());
             if let Some(prev) = previous_wakeup {
                 let tolerance_ns = early_wakeup_tolerance.as_nanos();
                 let prev_ns = prev.as_nanos().saturating_sub(tolerance_ns);
@@ -428,7 +403,7 @@ pub mod util {
                 (aligned_ts_ns % 1_000_000_000) as u32,
             );
 
-            self.wakeup = instant::origin() + aligned_ts;
+            self.wakeup_time = instant::origin() + aligned_ts;
             self.interval = interval;
         }
 
@@ -436,7 +411,22 @@ pub mod util {
         ///
         /// If offset is specified, current time will be evaluated as `SystemTime::now() + offset`.
         /// This is useful when you want to align with offseted system clock.
-        #[cfg(feature = "interval-align-system")]
+        ///
+        /// ```ignore
+        /// let handle: Interval = todo!();
+        ///
+        /// async {
+        ///     let sleep_interval = Duration::from_micros(3_000);
+        ///     let tolerance = Duration::from_micros(100);
+        ///     
+        ///     handle.align_with_system_clock(0., sleep_interval, tolerance);
+        ///     
+        ///     for i in 0..10000 {
+        ///         handle.tick().await;
+        ///     }   
+        /// }
+        /// ```
+        #[cfg(feature = "system-clock")]
         pub fn align_with_system_clock(
             &mut self,
             offset_sec: f64,

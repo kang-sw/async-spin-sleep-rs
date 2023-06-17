@@ -170,9 +170,10 @@ async fn interval() {
         let interval_error_percent = interval_error.abs() / interval.as_secs_f64() * 100.;
 
         print!(
-            "overslept {:?} - alignemnt  {:.1?}us - interval  {:.3}ms (e {:.3}ms)",
+            "overslept {:?} - alignemnt {:.1?}us (ofst {:.1}us) - interval  {:.3}ms (e {:.3}ms)",
             x,
             error_sec * 1e6,
+            offset * 1e6,
             actual_interval.as_secs_f64() * 1e3,
             interval_error * 1e3
         );

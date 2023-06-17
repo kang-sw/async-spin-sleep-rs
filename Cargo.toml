@@ -1,6 +1,6 @@
 [package]
 name = "async-spin-sleep"
-version = "0.3.6"
+version = "0.4.0"
 edition = "2021"
 description = "A crate providing a highly accurate asynchronous timer for multiple async tasks using spin sleep in a single thread."
 repository = "https://github.com/kang-sw/async-spin-sleep-rs"
@@ -25,5 +25,5 @@ static_assertions = "1"
 chrono = { default-features = false, version = "0.4" }
 
 [features]
-default = ["interval-align-system"]
-interval-align-system = []
+default = ["system-clock"]
+system-clock = []
