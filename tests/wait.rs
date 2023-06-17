@@ -218,6 +218,8 @@ async fn long_interval() {
     let interval = Duration::from_micros(500);
     let mut ticker = handle.interval(interval);
 
+    ticker.align_now(None, None, 0);
+
     for i in 0..3000 {
         ticker.tick().await.unwrap();
         let elapsed = replace(&mut latest_tick, Instant::now()).elapsed();
