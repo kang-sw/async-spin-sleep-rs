@@ -327,20 +327,16 @@ pub mod util {
             let now = Instant::now();
             *wakeup = *wakeup + *interval;
 
-            if now > *wakeup {
+            let minimum_next = now + minimum_interval;
+            if minimum_next > *wakeup {
                 // XXX: We use 128 bit integer to avoid overflow in nanosecond domain.
                 //  This is not a perfect solution, but it should be enough for most cases,
                 //  as 'over-sleep' is relatively rare case thus slow path is not a big deal.
                 let interval_ns = interval.as_nanos();
-                let num_ticks = ((now - *wakeup).as_nanos() - 1) / interval_ns + 1;
+                let num_ticks = ((minimum_next - *wakeup).as_nanos() - 1) / interval_ns + 1;
 
                 // Set next wakeup to nearest aligned timestamp.
                 *wakeup += Duration::from_nanos((interval_ns * num_ticks) as _);
-
-                // If the next wakeup is too close, then skip it.
-                if *wakeup - now < minimum_interval {
-                    *wakeup += *interval;
-                }
             }
 
             result
@@ -476,6 +472,7 @@ mod instant {
 
 /* ------------------------------------------- Future ------------------------------------------- */
 #[derive(Debug)]
+#[must_use = "futures do nothing unless you `.await` or poll them"]
 pub struct SleepFuture {
     tx: channel::Sender<driver::Event>,
     gc_counter: Arc<AtomicIsize>,
