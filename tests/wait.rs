@@ -1,4 +1,7 @@
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::{
+    mem::replace,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
 
 #[tokio::test]
 async fn verify_unbounded() {
@@ -203,5 +206,29 @@ async fn interval() {
         } else {
             print!("            \r");
         }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn long_interval() {
+    let (handle, driver) = async_spin_sleep::create_d_ary::<4>();
+    std::thread::spawn(driver);
+
+    let mut latest_tick = Instant::now();
+    let interval = Duration::from_micros(500);
+    let mut ticker = handle.interval(interval);
+
+    for i in 0..3000 {
+        ticker.tick().await.unwrap();
+        let elapsed = replace(&mut latest_tick, Instant::now()).elapsed();
+        print!("{elapsed:?}     \r");
+
+        if i % 5 == 0 {
+            // perioidcally, sleep for a while to simulate some heavy work cannot be done within
+            // interval time
+            handle.sleep_for(Duration::from_millis(1)).await.unwrap();
+        }
+
+        assert!(elapsed >= interval / 2, "minimum interval(default=half) must be respected");
     }
 }
