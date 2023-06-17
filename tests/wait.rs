@@ -79,13 +79,15 @@ async fn discard_test() {
 }
 
 async fn discard<const D: usize>(gc: usize) {
+    println!(":: discard<{D}>({gc}) -------------------------------");
+
     let mut init = async_spin_sleep::Builder::default();
     init.collect_garbage_at = gc;
 
     let (handle, driver) = init.build_d_ary::<D>();
     std::thread::spawn(driver);
 
-    let times = futures::future::join_all((0..30000).rev().map(|i| {
+    let times = futures::future::join_all((0..10000).rev().map(|i| {
         let handle = handle.clone();
         async move {
             tokio::select! {

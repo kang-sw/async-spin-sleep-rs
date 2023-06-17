@@ -127,9 +127,8 @@ mod driver {
         // status of 'aborted but not yet handled' node count, i.e. garbage nodes.
         let gc_counter = this.gc_counter;
 
-        'outermost: loop {
+        'worker: loop {
             let now = to_usec(Instant::now());
-
             let mut event = if let Some(node) = nodes.peek() {
                 let remain = node.timeout_usec.saturating_sub(now);
                 if remain > resolution_usec {
@@ -137,7 +136,7 @@ mod driver {
                     let Ok(x) = rx.recv_timeout(Duration::from_micros( system_sleep_for)) else { continue };
                     x
                 } else {
-                    loop {
+                    'busy_wait: loop {
                         let now = to_usec(Instant::now());
                         if now >= node.timeout_usec {
                             let node = nodes.pop().unwrap();
@@ -147,16 +146,22 @@ mod driver {
                                 unsafe { (*waker.get()).take().unwrap().wake() }
                             }
 
-                            gc_counter.fetch_sub(1, Ordering::Release);
-                            continue 'outermost;
+                            let n_garbage = gc_counter.fetch_sub(1, Ordering::Release);
+                            if n_garbage > this.collect_garbage_at as isize {
+                                let n_collect = gc(&mut nodes) as _;
+                                gc_counter.fetch_sub(n_collect, Ordering::Release);
+                            }
+
+                            continue 'worker;
                         } else {
                             match rx.try_recv() {
-                                Ok(x) => break x,
+                                Ok(x) => break 'busy_wait x,
                                 Err(TryRecvError::Disconnected) if nodes.is_empty() => {
-                                    break 'outermost
+                                    break 'worker
                                 }
                                 Err(TryRecvError::Disconnected) | Err(TryRecvError::Empty) => {
-                                    std::thread::yield_now()
+                                    std::thread::yield_now();
+                                    continue 'busy_wait;
                                 }
                             }
                         }
@@ -170,34 +175,41 @@ mod driver {
             };
 
             if gc_counter.load(Ordering::Acquire) as usize > this.collect_garbage_at {
-                let fn_retain = |x: &Node| x.weak_waker.upgrade().is_some();
-
-                let prev_len = nodes.len();
-                let mut vec = nodes.into_vec();
-                vec.retain(fn_retain);
-                nodes = DaryHeap::from(vec);
-
-                let n_collected = prev_len - nodes.len();
-                gc_counter.fetch_sub(n_collected as _, Ordering::Release);
+                let n_collect = gc(&mut nodes) as _;
+                gc_counter.fetch_sub(n_collect, Ordering::Release);
             }
 
-            loop {
+            'flush: loop {
                 match event {
                     Event::SleepUntil(desc) => nodes
                         .push(Node { timeout_usec: to_usec(desc.timeout), weak_waker: desc.waker }),
                 };
 
-                // Consume all events in the channel.
-                match rx.try_recv() {
-                    Ok(x) => event = x,
-                    Err(TryRecvError::Disconnected) if nodes.is_empty() => break 'outermost,
-                    Err(TryRecvError::Disconnected) | Err(TryRecvError::Empty) => break,
-                }
+                event = match rx.try_recv() {
+                    Ok(x) => x,
+                    Err(TryRecvError::Disconnected) if nodes.is_empty() => break 'worker,
+                    Err(TryRecvError::Disconnected) | Err(TryRecvError::Empty) => break 'flush,
+                };
             }
         }
 
         assert!(nodes.is_empty());
         assert_eq!(gc_counter.load(Ordering::Relaxed), 0);
+    }
+
+    fn gc<const D: usize>(nodes: &mut DaryHeap<Node, D>) -> usize {
+        let fn_retain = |x: &Node| x.weak_waker.upgrade().is_some();
+
+        let prev_len = nodes.len();
+
+        *nodes = {
+            let mut vec = std::mem::take(nodes).into_vec();
+            vec.retain(fn_retain);
+            DaryHeap::from(vec)
+        };
+
+        let n_collected = prev_len - nodes.len();
+        n_collected
     }
 
     #[derive(Debug, Clone)]
@@ -549,5 +561,7 @@ impl Drop for SleepFuture {
         if !matches!(&self.state, SleepState::Pending) {
             self.gc_counter.fetch_add(1, Ordering::Release);
         }
+
+        // eprint!("{}          \r", self.gc_counter.load(Ordering::Relaxed));
     }
 }
