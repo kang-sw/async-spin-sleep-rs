@@ -13,7 +13,7 @@ async fn verify_unbounded() {
     .await;
 
     let len = times.len();
-    let avg = times.into_iter().map(|x| x.unwrap()).sum::<Duration>() / len as u32;
+    let avg = times.into_iter().map(|x| x.unwrap().overslept()).sum::<Duration>() / len as u32;
     println!("avg: {:?}", avg);
 }
 
@@ -31,7 +31,7 @@ async fn verify_channel_size() {
     .await;
 
     let len = times.len();
-    let avg = times.into_iter().map(|x| x.unwrap()).sum::<Duration>() / len as u32;
+    let avg = times.into_iter().map(|x| x.unwrap().overslept()).sum::<Duration>() / len as u32;
     println!("avg: {:?}", avg);
 }
 
@@ -106,8 +106,8 @@ async fn discard<const D: usize>(gc: usize) {
     }))
     .await;
 
-    let avg = times.iter().sum::<Duration>() / times.len() as u32;
-    let max = times.iter().max().unwrap();
+    let avg = times.iter().map(|x| x.overslept()).sum::<Duration>() / times.len() as u32;
+    let max = times.iter().max_by(|a, b| a.overslept().cmp(&b.overslept())).unwrap();
     println!("avg: {avg:?} max: {max:?}");
 }
 
@@ -120,7 +120,7 @@ async fn multiple_threads() {
         let handle = handle.clone();
         tokio::spawn(async move {
             let e = handle.sleep_for(std::time::Duration::from_micros(i) * 150).await.unwrap();
-            if e > Duration::from_millis(1) {
+            if e.overslept() > Duration::from_millis(1) {
                 print!(
                     "{sleep:?} in {thread:?}, ",
                     sleep = e,
@@ -133,7 +133,7 @@ async fn multiple_threads() {
 
     let times = futures::future::join_all(tasks).await;
     let len = times.len();
-    let avg = times.into_iter().map(|x| x.unwrap()).sum::<Duration>() / len as u32;
+    let avg = times.into_iter().map(|x| x.unwrap().overslept()).sum::<Duration>() / len as u32;
 
     println!("avg: {:?}", avg);
 }
@@ -153,7 +153,7 @@ async fn interval() {
     let mut offset = 0.;
     let mut acc_error = 0.;
     for idx in 0..10000 {
-        let x = obj.wait().await.unwrap();
+        let x = obj.tick().await.unwrap();
         print!("[{idx}] ");
 
         let now_ns = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();

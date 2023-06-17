@@ -284,9 +284,10 @@ impl Handle {
 }
 
 pub mod util {
-    use crate::SleepResult;
+    use crate::{instant, Report};
     use std::time::{Duration, Instant};
 
+    /// Interval controller.
     #[derive(Debug, Clone)]
     pub struct Interval {
         pub(crate) handle: super::Handle,
@@ -295,7 +296,19 @@ pub mod util {
     }
 
     impl Interval {
-        pub async fn wait(&mut self) -> SleepResult {
+        /// Wait until next interval.
+        ///
+        /// This function will return [`SleepResult`] which contains the duration that overly passed
+        /// the specified interval. As it internally aligns to the specified interval, it should not
+        /// be drifted over time, in terms of [`Instant`] clock domain.
+        ///
+        /// - `minimum_interval`: Minimum interval to wait. This prevents burst after long
+        ///   inactivity on `Interval` object.
+        pub async fn tick_with_min_interval(
+            &mut self,
+            minimum_interval: Duration,
+        ) -> Result<Report, crate::Error> {
+            assert!(minimum_interval <= self.interval);
             let Self { handle, wakeup_time: wakeup, interval } = self;
 
             let result = handle.sleep_until(*wakeup).await;
@@ -309,10 +322,21 @@ pub mod util {
                 let interval_ns = interval.as_nanos();
                 let num_ticks = ((now - *wakeup).as_nanos() - 1) / interval_ns + 1;
 
+                // Set next wakeup to nearest aligned timestamp.
                 *wakeup += Duration::from_nanos((interval_ns * num_ticks) as _);
+
+                // If the next wakeup is too close, then skip it.
+                if *wakeup - now < minimum_interval {
+                    *wakeup += *interval;
+                }
             }
 
             result
+        }
+
+        /// A shortcut for [`tick_with_min_interval`] with `minimum_interval` set to half.
+        pub async fn tick(&mut self) -> Result<Report, crate::Error> {
+            self.tick_with_min_interval(self.interval / 2).await
         }
 
         /// Reset interval to the specified duration.
@@ -386,6 +410,21 @@ pub mod util {
             self.interval = interval;
         }
 
+        /// Shortcut for [`Self::align_clock`] from now.
+        pub fn align_now(
+            &mut self,
+            interval: Option<Duration>,
+            initial_interval_tolerance: Option<Duration>,
+            align_offset_ns: i64,
+        ) {
+            self.align_with_clock(
+                || instant::time_from_epoch(),
+                interval,
+                initial_interval_tolerance,
+                align_offset_ns,
+            );
+        }
+
         /// Shortcut for [`Self::align_clock`] with [`std::time::SystemTime`] as the time source.
         #[cfg(feature = "system-clock")]
         pub fn align_with_system_clock(
@@ -417,6 +456,10 @@ mod instant {
 
         *PIVOT
     }
+
+    pub(crate) fn time_from_epoch() -> std::time::Duration {
+        Instant::now().duration_since(origin())
+    }
 }
 
 /* ------------------------------------------- Future ------------------------------------------- */
@@ -432,9 +475,28 @@ pub struct SleepFuture {
 static_assertions::assert_impl_all!(SleepFuture: Send, Sync, Unpin);
 
 #[derive(Debug, thiserror::Error)]
-pub enum SleepError {
+pub enum Error {
     #[error("driver shutdown")]
     Shutdown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Report {
+    /// Timer has been correctly requested, and woke up normally. Returned value is overslept
+    /// duration than the requested timeout.
+    Completed(Duration),
+
+    /// Timer has not been requested as the timeout is already expired.
+    ExpiredTimer(Duration),
+}
+
+impl Report {
+    pub fn overslept(&self) -> Duration {
+        match self {
+            Self::Completed(dur) => *dur,
+            Self::ExpiredTimer(dur) => *dur,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -447,20 +509,21 @@ enum SleepState {
 unsafe impl Sync for SleepState {}
 unsafe impl Send for SleepState {}
 
-pub type SleepResult = Result<Duration, SleepError>;
-
 impl std::future::Future for SleepFuture {
-    type Output = SleepResult;
+    type Output = Result<Report, Error>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let now = Instant::now();
 
         if let Some(over) = now.checked_duration_since(self.timeout) {
-            if matches!(self.state, SleepState::Sleeping(_)) {
+            let result = if matches!(self.state, SleepState::Sleeping(_)) {
                 self.state = SleepState::Woken;
-            }
+                Report::Completed(over)
+            } else {
+                Report::ExpiredTimer(over)
+            };
 
-            return Poll::Ready(Ok(over));
+            return Poll::Ready(Ok(result));
         }
 
         if matches!(self.state, SleepState::Pending) {
@@ -471,7 +534,7 @@ impl std::future::Future for SleepFuture {
             });
 
             if let Err(_) = self.tx.send(event) {
-                return Poll::Ready(Err(SleepError::Shutdown));
+                return Poll::Ready(Err(Error::Shutdown));
             }
 
             self.state = SleepState::Sleeping(waker);
