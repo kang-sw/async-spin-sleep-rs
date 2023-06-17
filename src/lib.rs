@@ -73,6 +73,8 @@ impl Builder {
     }
 
     pub fn build_d_ary<const D: usize>(self) -> (Handle, impl FnOnce()) {
+        let _ = instant::origin(); // Force initialization of the global pivot time
+
         let (tx, rx) = if let Some(cap) = self.channel_capacity {
             channel::bounded(cap)
         } else {
@@ -282,9 +284,8 @@ impl Handle {
 }
 
 pub mod util {
+    use crate::SleepResult;
     use std::time::{Duration, Instant};
-
-    use crate::{instant, SleepResult};
 
     #[derive(Debug, Clone)]
     pub struct Interval {
@@ -315,10 +316,6 @@ pub mod util {
         }
 
         /// Reset interval to the specified duration.
-        ///
-        /// > **_warning_** This method will break the alignment set up by
-        /// > [`Self::align_with_clock`]. If you want to modify interval without breaking the
-        /// > alignment, use [`Self::align_with_clock`] instead.
         pub fn set_interval(&mut self, interval: Duration) {
             assert!(interval > Duration::default());
             self.wakeup_time -= self.interval;
@@ -334,126 +331,84 @@ pub mod util {
             self.wakeup_time
         }
 
-        /// Sets next tick at the specified instant. After this point, timestamp will be aligned
-        /// to given instant. This may break the alignment set up by [`Self::set_interval`].
-        pub fn set_wakeup_time(&mut self, instant: Instant) {
-            self.wakeup_time = instant;
-        }
-
-        /// Align with specified clock. This method will align the next tick to the specified clock
-        /// domain with specified interval.
+        /// This method aligns the subsequent tick to a given interval. Following the alignment, the
+        /// timestamp will conform to the specified interval.
         ///
-        /// ```ignore
-        /// let handle: Interval = todo!();
-        /// let func = || std::time::SystemTime::now() - std::time::SystemTime::UNIX_EPOCH;
-        /// handle.align_with_clock(func, handle.interval(), Default::default());
-        /// ```
+        /// Parameters:
+        /// - `now_since_epoch`: A function yielding the current time since the epoch. It's
+        ///   internally converted to an [`Instant`], hence, should return the most recent
+        ///   timestamp.
+        /// - `align_offset_ns`: This parameter can adjust the alignment timing. For example, an
+        ///   offset of 100us applied to a next tick scheduled at 9000us will push the tick to
+        ///   9100us.
+        /// - `initial_interval_tolerance`: This defines the permissible noise level for the initial
+        ///   interval. If set to zero, the actual sleep duration will exceed the interval,
+        ///   potentially causing a tick to be skipped as the actual sleep duration might be twice
+        ///   the interval. It's advisable to set it to 10% of the interval to prevent the
+        ///   `align_clock` command from disrupting the initial interval.
         ///
-        /// The next tick will occur after the previously scheduled wakeup timestamp. If the
-        /// provided target timestamp is imprecise, the early_wakeup_tolerance value can be used to
-        /// adjust when it is considered as the wakeup point.
-        ///
-        /// For instance, let's consider a system with an interval of 1000. If the previous wakeup
-        /// happened at 7000, resulting in the next wakeup being set to 8000, and the match request
-        /// occurred at 7997, there is a difference of only 3 between the actual wakeup and the
-        /// match. However, to ensure adherence to the given guarantees, the next tick is scheduled
-        /// after 1000 units, specifically at 8997.
-        ///
-        /// By setting early_wakeup_tolerance to around 100, the next wakeup would be adjusted to
-        /// 7900 instead of 8000. Consequently, the next tick would occur at 7997, maintaining the
-        /// regular interval requirement.
+        /// Note: For example, if `now_since_epoch()` gives 8500us and the interval is 1000us, the
+        /// subsequent tick will be adjusted to 9000us, aligning with the interval.
         pub fn align_with_clock(
             &mut self,
-            now_time_since_epoch: impl Fn() -> Duration,
-            interval: Duration,
-            early_wakeup_tolerance: Duration,
+            now_since_epoch: impl FnOnce() -> Duration,
+            interval: Option<Duration>, // If none, reuse the previous interval.
+            initial_interval_tolerance: Option<Duration>, // If none, 10% of the interval.
+            align_offset_ns: i64,
         ) {
-            assert!(interval > Duration::default());
+            let prev_trig = self.wakeup_time - self.interval;
+            let dst_now_ns = now_since_epoch().as_nanos() as i64;
+            let inst_now = Instant::now();
 
-            let dst_now_ns = now_time_since_epoch().as_nanos();
-            let src_now = instant::time_since_epoch();
-            let src_now_ns = src_now.as_nanos();
+            let interval = interval.unwrap_or(self.interval);
+            let interval_ns = interval.as_nanos() as i64;
+            let interval_tolerance =
+                initial_interval_tolerance.unwrap_or(Duration::from_nanos((interval_ns / 10) as _));
 
-            let interval_ns = interval.as_nanos();
-            let src_now_gap = (src_now_ns % interval_ns) as i64;
-            let dst_now_gap = (dst_now_ns % interval_ns) as i64;
+            assert!(interval > Duration::default(), "interval must be larger than zero");
+            assert!(interval_tolerance < interval);
 
-            let mut src_delay_ns = dst_now_gap - src_now_gap;
-            if src_delay_ns < 0 {
-                src_delay_ns += interval_ns as i64;
-            }
-
-            // calculate target alignment timestamp
-            let n_ticks = (src_now_ns / interval_ns).saturating_sub(1); // naively align to previous tick
-            let mut aligned_ts_ns = n_ticks * interval_ns + src_delay_ns as u128;
-
-            let previous_wakeup = self.wakeup_time.checked_duration_since(instant::origin());
-            if let Some(prev) = previous_wakeup {
-                let tolerance_ns = early_wakeup_tolerance.as_nanos();
-                let prev_ns = prev.as_nanos().saturating_sub(tolerance_ns);
-                if let Some(wait_time_ns) = prev_ns.checked_sub(aligned_ts_ns) {
-                    // we have to trigger *after* previous target alignment,
-                    let n_ticks = (wait_time_ns - 1) / interval_ns + 1;
-                    aligned_ts_ns += n_ticks * interval_ns;
+            let ticks_to_align = {
+                let mut val = interval_ns - (dst_now_ns % interval_ns) + align_offset_ns;
+                if val < 0 {
+                    val += (val / interval_ns + 1) * interval_ns;
                 }
+                Duration::from_nanos((val % interval_ns) as _)
+            };
+
+            let mut desired_wake_up = inst_now + ticks_to_align;
+            if desired_wake_up < prev_trig + interval - interval_tolerance {
+                desired_wake_up += interval;
+                debug_assert!(desired_wake_up >= prev_trig + interval - interval_tolerance);
             }
 
-            let aligned_ts = Duration::new(
-                (aligned_ts_ns / 1_000_000_000) as u64,
-                (aligned_ts_ns % 1_000_000_000) as u32,
-            );
-
-            self.wakeup_time = instant::origin() + aligned_ts;
+            self.wakeup_time = desired_wake_up;
             self.interval = interval;
         }
 
-        /// Align with system clock. This is a shortcut for [`Interval::align_with_clock`].
-        ///
-        /// If offset is specified, current time will be evaluated as `SystemTime::now() + offset`.
-        /// This is useful when you want to align with offseted system clock.
-        ///
-        /// ```ignore
-        /// let handle: Interval = todo!();
-        ///
-        /// async {
-        ///     let sleep_interval = Duration::from_micros(3_000);
-        ///     let tolerance = Duration::from_micros(100);
-        ///     
-        ///     handle.align_with_system_clock(0., sleep_interval, tolerance);
-        ///     
-        ///     for i in 0..10000 {
-        ///         handle.tick().await;
-        ///     }   
-        /// }
-        /// ```
+        /// Shortcut for [`Self::align_clock`] with [`std::time::SystemTime`] as the time source.
         #[cfg(feature = "system-clock")]
         pub fn align_with_system_clock(
             &mut self,
-            offset_sec: f64,
-            interval: Duration,
-            early_wakeup_tolerance: Duration,
+            interval: Option<Duration>,
+            initial_interval_tolerance: Option<Duration>,
+            align_offset_ns: i64,
         ) {
             self.align_with_clock(
                 || {
-                    let ts = std::time::SystemTime::now()
-                        .duration_since(std::time::SystemTime::UNIX_EPOCH)
-                        .unwrap();
-
-                    if offset_sec >= 0. {
-                        ts + Duration::from_secs_f64(offset_sec)
-                    } else {
-                        ts - Duration::from_secs_f64(-offset_sec)
-                    }
+                    let now = std::time::SystemTime::now();
+                    now.duration_since(std::time::UNIX_EPOCH).unwrap()
                 },
                 interval,
-                early_wakeup_tolerance,
+                initial_interval_tolerance,
+                align_offset_ns,
             );
         }
     }
 }
 
 mod instant {
-    use std::time::{Duration, Instant};
+    use std::time::Instant;
 
     pub(crate) fn origin() -> Instant {
         lazy_static::lazy_static!(
@@ -461,10 +416,6 @@ mod instant {
         );
 
         *PIVOT
-    }
-
-    pub(crate) fn time_since_epoch() -> Duration {
-        Instant::now() - origin()
     }
 }
 

@@ -147,7 +147,7 @@ async fn interval() {
     let tolerance = Duration::from_micros(300);
     let interval_ns = interval.as_nanos() as i128;
     let mut obj = handle.interval(interval);
-    obj.align_with_system_clock(0., interval, tolerance);
+    obj.align_with_system_clock(None, Some(tolerance), 0);
 
     let mut prev_wakup = Instant::now();
     let mut offset = 0.;
@@ -190,7 +190,7 @@ async fn interval() {
 
         if idx % 150 == 0 {
             offset -= acc_error;
-            obj.align_with_system_clock(offset, interval, tolerance);
+            obj.align_with_system_clock(None, Some(tolerance), (offset * 1e9) as i64);
             linebreak = true;
 
             print!(" << align >> ");
