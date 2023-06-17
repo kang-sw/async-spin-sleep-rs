@@ -1,4 +1,4 @@
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[tokio::test]
 async fn verify_unbounded() {
@@ -143,16 +143,18 @@ async fn interval() {
     let (handle, driver) = async_spin_sleep::create_d_ary::<4>();
     std::thread::spawn(driver);
 
-    let interval = Duration::from_micros(1500);
+    let interval = Duration::from_micros(3000);
     let tolerance = Duration::from_micros(300);
     let interval_ns = interval.as_nanos() as i128;
     let mut obj = handle.interval(interval);
     obj.align_with_system_clock(0., interval, tolerance);
 
+    let mut prev_wakup = Instant::now();
     let mut offset = 0.;
     let mut acc_error = 0.;
     for idx in 0..10000 {
         let x = obj.wait().await.unwrap();
+        print!("[{idx}] ");
 
         let now_ns = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
         let mut error_ns = now_ns as i128 % interval_ns;
@@ -161,15 +163,42 @@ async fn interval() {
         }
 
         let error_sec = error_ns as f64 / 1e9;
-        print!("overslept {:?} - alignemnt  {:.1?}us", x, error_sec * 1e6);
-        acc_error = acc_error * 0.98 + error_sec * 0.02;
+        let actual_interval = prev_wakup.elapsed();
+        prev_wakup = Instant::now();
 
-        if idx % 100 == 99 {
+        let interval_error = actual_interval.as_secs_f64() - interval.as_secs_f64();
+        let interval_error_percent = interval_error.abs() / interval.as_secs_f64() * 100.;
+
+        print!(
+            "overslept {:?} - alignemnt  {:.1?}us - interval  {:.3}ms (e {:.3}ms)",
+            x,
+            error_sec * 1e6,
+            actual_interval.as_secs_f64() * 1e3,
+            interval_error * 1e3
+        );
+
+        let alpha = 0.01;
+        acc_error = acc_error * (1. - alpha) + error_sec * alpha;
+
+        let mut linebreak = false;
+
+        if interval_error_percent > 10. {
+            print!(" !! interval error !! ");
+            linebreak = true;
+        }
+
+        if idx % 150 == 0 {
             offset -= acc_error;
             obj.align_with_system_clock(offset, interval, tolerance);
-            println!("                                     ");
+            linebreak = true;
+
+            print!(" << align >> ");
+        }
+
+        if linebreak {
+            println!("               ");
         } else {
-            print!("\r");
+            print!("            \r");
         }
     }
 }

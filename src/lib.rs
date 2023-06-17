@@ -334,20 +334,20 @@ pub mod util {
 
     impl Interval {
         pub async fn wait(&mut self) -> SleepResult {
-            let Self { handle, wakeup: sleep_until, interval } = self;
+            let Self { handle, wakeup, interval } = self;
 
-            let result = handle.sleep_until(*sleep_until).await;
+            let result = handle.sleep_until(*wakeup).await;
             let now = Instant::now();
-            *sleep_until = *sleep_until + *interval;
+            *wakeup = *wakeup + *interval;
 
-            if now > *sleep_until {
+            if now > *wakeup {
                 // XXX: We use 128 bit integer to avoid overflow in nanosecond domain.
                 //  This is not a perfect solution, but it should be enough for most cases,
                 //  as 'over-sleep' is relatively rare case thus slow path is not a big deal.
                 let interval_ns = interval.as_nanos();
-                let num_ticks = ((now - *sleep_until).as_nanos() - 1) / interval_ns + 1;
+                let num_ticks = ((now - *wakeup).as_nanos() - 1) / interval_ns + 1;
 
-                *sleep_until += Duration::from_nanos((interval_ns * num_ticks) as _);
+                *wakeup += Duration::from_nanos((interval_ns * num_ticks) as _);
             }
 
             result
@@ -355,8 +355,9 @@ pub mod util {
 
         /// Reset interval to the specified duration.
         ///
-        /// > **_warning_** This method will break the alignment set up by [`Self::wakeup_at`].
-        /// > If you want to keep the alignment,
+        /// > **_warning_** This method will break the alignment set up by
+        /// > [`Self::align_with_clock`]. If you want to modify interval without breaking the
+        /// > alignment, use [`Self::align_with_clock`] instead.
         pub fn set_interval(&mut self, interval: Duration) {
             assert!(interval > Duration::default());
             self.wakeup -= self.interval;
@@ -378,7 +379,8 @@ pub mod util {
             self.wakeup = instant;
         }
 
-        /// Align with
+        /// Align with specified clock. This method will align the next tick to the specified
+        /// clock domain with specified interval.
         ///
         /// ```ignore
         /// let handle: Interval = todo!();
@@ -416,7 +418,7 @@ pub mod util {
                 let prev_ns = prev.as_nanos().saturating_sub(tolerance_ns);
                 if let Some(wait_time_ns) = prev_ns.checked_sub(aligned_ts_ns) {
                     // we have to trigger *after* previous target alignment,
-                    let n_ticks = wait_time_ns / interval_ns;
+                    let n_ticks = (wait_time_ns - 1) / interval_ns + 1;
                     aligned_ts_ns += n_ticks * interval_ns;
                 }
             }
@@ -431,6 +433,9 @@ pub mod util {
         }
 
         /// Align with system clock. This is a shortcut for [`Interval::align_with_clock`].
+        ///
+        /// If offset is specified, current time will be evaluated as `SystemTime::now() + offset`.
+        /// This is useful when you want to align with offseted system clock.
         #[cfg(feature = "interval-align-system")]
         pub fn align_with_system_clock(
             &mut self,
