@@ -21,12 +21,18 @@ use crossbeam::channel;
 use driver::{NodeDesc, WakerNode};
 
 /* -------------------------------------------- Init -------------------------------------------- */
-#[cfg(target_os = "windows")]
-const DEFAULT_SCHEDULE_RESOLUTION: Duration = Duration::from_millis(33);
+/// Usually ~1ms resolution, thus 4ms should be enough.
 #[cfg(target_os = "linux")]
-const DEFAULT_SCHEDULE_RESOLUTION: Duration = Duration::from_millis(3);
+const DEFAULT_SCHEDULE_RESOLUTION: Duration = Duration::from_millis(4);
+
+/// In some cases, ~3ms reports unstable behavior. Give more margin here.
 #[cfg(target_os = "macos")]
 const DEFAULT_SCHEDULE_RESOLUTION: Duration = Duration::from_millis(10);
+
+/// Fallback case including Windows. For windows, timer resolution is ~16ms in most cases, however,
+/// gives some margin here to avoid unstable behavior.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+const DEFAULT_SCHEDULE_RESOLUTION: Duration = Duration::from_millis(33);
 
 #[derive(Debug, derive_setters::Setters)]
 #[setters(prefix = "with_")]
@@ -309,10 +315,7 @@ pub mod util {
         ///
         /// - `minimum_interval`: Minimum interval to wait. This prevents burst after long
         ///   inactivity on `Interval` object.
-        pub async fn tick_with_min_interval(
-            &mut self,
-            minimum_interval: Duration,
-        ) -> Result<Report, crate::Error> {
+        pub async fn tick_with_min_interval(&mut self, minimum_interval: Duration) -> Report {
             assert!(minimum_interval <= self.interval);
             let Self { handle, wakeup_time: wakeup, interval } = self;
 
@@ -336,7 +339,7 @@ pub mod util {
         }
 
         /// A shortcut for [`tick_with_min_interval`] with `minimum_interval` set to half.
-        pub async fn tick(&mut self) -> Result<Report, crate::Error> {
+        pub async fn tick(&mut self) -> Report {
             self.tick_with_min_interval(self.interval / 2).await
         }
 
@@ -476,12 +479,6 @@ pub struct SleepFuture {
 #[cfg(test)]
 static_assertions::assert_impl_all!(SleepFuture: Send, Sync, Unpin);
 
-#[derive(Debug, thiserror::Error)]
-pub enum Error {
-    #[error("driver shutdown")]
-    Shutdown,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Report {
     /// Timer has been correctly requested, and woke up normally. Returned value is overslept
@@ -490,14 +487,33 @@ pub enum Report {
 
     /// Timer has not been requested as the timeout is already expired.
     ExpiredTimer(Duration),
+
+    /// We woke up a bit earlier than required. It is usually hundreads of nanoseconds.
+    CompletedEarly(Duration),
 }
 
 impl Report {
+    /// Returns how many ticks the timer overslept than required duration.
     pub fn overslept(&self) -> Duration {
         match self {
             Self::Completed(dur) => *dur,
             Self::ExpiredTimer(dur) => *dur,
+
+            // NOTE: As duration should always be positive value, we can safely return zero here.
+            Self::CompletedEarly(_) => Duration::ZERO,
         }
+    }
+
+    /// Trick to make previous code compatible with this version.
+    #[doc(hidden)]
+    pub fn unwrap(self) -> Self {
+        self
+    }
+
+    /// Trick to make previous code compatible with this version.
+    #[doc(hidden)]
+    pub fn ok(self) -> Option<Self> {
+        Some(self)
     }
 }
 
@@ -509,7 +525,7 @@ enum SleepState {
 }
 
 impl std::future::Future for SleepFuture {
-    type Output = Result<Report, Error>;
+    type Output = Report;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let now = Instant::now();
@@ -522,7 +538,7 @@ impl std::future::Future for SleepFuture {
                 Report::ExpiredTimer(over)
             };
 
-            return Poll::Ready(Ok(result));
+            return Poll::Ready(result);
         }
 
         if matches!(self.state, SleepState::Pending) {
@@ -532,16 +548,13 @@ impl std::future::Future for SleepFuture {
                 waker: Arc::downgrade(&waker),
             });
 
-            if let Err(_) = self.tx.send(event) {
-                return Poll::Ready(Err(Error::Shutdown));
-            }
-
+            self.tx.send(event).expect("timer driver never expires");
             self.state = SleepState::Sleeping(waker);
         } else if let SleepState::Sleeping(node) = &self.state {
             // We woke up too early. Check if it is due to broken clock monotonicity.
             if node.is_expired() {
                 self.state = SleepState::Woken;
-                return Poll::Ready(Ok(Report::Completed(Duration::default())));
+                return Poll::Ready(Report::CompletedEarly(self.timeout - now));
             } else {
                 // If not, this is a spurious wakeup. We should sleep again.
             }

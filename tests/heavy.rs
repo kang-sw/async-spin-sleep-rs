@@ -22,7 +22,7 @@ fn heavy_use() {
                     let updator = updator.clone();
                     async move {
                         loop {
-                            handle.sleep_for(Duration::from_millis(10)).await.ok();
+                            handle.sleep_for(Duration::from_millis(10)).await;
                             updator.store(now_us(), std::sync::atomic::Ordering::Relaxed);
                         }
                     }

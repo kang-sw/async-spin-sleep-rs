@@ -11,10 +11,7 @@ fn doc_readme_1() {
 
     block_on(async {
         let begin = Instant::now();
-        let overslept = handle
-            .sleep_for(Duration::from_millis(100))
-            .await
-            .expect("sleep function always return Ok(...), as long as the driver thread alive");
+        let overslept = handle.sleep_for(Duration::from_millis(100)).await;
 
         assert!(begin.elapsed() >= Duration::from_millis(100));
         println!("t: {:?}, overslept: {:?}", begin.elapsed(), overslept);
