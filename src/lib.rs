@@ -18,13 +18,15 @@ use std::{
 };
 
 use crossbeam::channel;
-use driver::{NodeDesc, WakerCell};
+use driver::{NodeDesc, WakerNode};
 
 /* -------------------------------------------- Init -------------------------------------------- */
-#[cfg(windows)]
+#[cfg(target_os = "windows")]
 const DEFAULT_SCHEDULE_RESOLUTION: Duration = Duration::from_millis(33);
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 const DEFAULT_SCHEDULE_RESOLUTION: Duration = Duration::from_millis(3);
+#[cfg(target_os = "macos")]
+const DEFAULT_SCHEDULE_RESOLUTION: Duration = Duration::from_millis(10);
 
 #[derive(Debug, derive_setters::Setters)]
 #[setters(prefix = "with_")]
@@ -100,7 +102,6 @@ pub fn create_d_ary<const D: usize>() -> (Handle, impl FnOnce()) {
 /* ------------------------------------------- Driver ------------------------------------------- */
 mod driver {
     use std::{
-        cell::UnsafeCell,
         sync::{atomic::Ordering, Weak},
         task::Waker,
         time::{Duration, Instant},
@@ -143,8 +144,7 @@ mod driver {
                             let node = nodes.pop().unwrap();
 
                             if let Some(waker) = node.weak_waker.upgrade() {
-                                // SAFETY: No other thread access value of this pointer.
-                                unsafe { (*waker.get()).take().unwrap().wake() }
+                                waker.value.lock().take().expect("logic error").wake();
                             }
 
                             let n_garbage = gc_counter.fetch_sub(1, Ordering::Release);
@@ -216,7 +216,7 @@ mod driver {
     #[derive(Debug, Clone)]
     pub(crate) struct NodeDesc {
         pub timeout: Instant,
-        pub waker: Weak<WakerCell>,
+        pub waker: Weak<WakerNode>,
     }
 
     #[derive(Debug, Clone, Educe)]
@@ -226,7 +226,7 @@ mod driver {
         pub timeout_usec: u64,
 
         #[educe(Eq(ignore), PartialEq(ignore), PartialOrd(ignore), Ord(ignore))]
-        pub weak_waker: Weak<WakerCell>,
+        pub weak_waker: Weak<WakerNode>,
     }
 
     fn cmp_rev(a: &u64, b: &u64) -> std::cmp::Ordering {
@@ -238,26 +238,18 @@ mod driver {
     }
 
     #[derive(Debug)]
-    pub(crate) struct WakerCell {
-        // SAFETY: This UnsafeCell is only used to take the value out of the waker.
+    pub(crate) struct WakerNode {
         //  dsa sads
-        waker: UnsafeCell<Option<Waker>>,
+        value: parking_lot::Mutex<Option<Waker>>,
     }
 
-    unsafe impl Sync for WakerCell {}
-    unsafe impl Send for WakerCell {}
-
-    impl std::ops::Deref for WakerCell {
-        type Target = UnsafeCell<Option<Waker>>;
-
-        fn deref(&self) -> &Self::Target {
-            &self.waker
-        }
-    }
-
-    impl WakerCell {
+    impl WakerNode {
         pub fn new(waker: Waker) -> Self {
-            Self { waker: UnsafeCell::new(Some(waker)) }
+            Self { value: parking_lot::Mutex::new(Some(waker)) }
+        }
+
+        pub fn is_expired(&self) -> bool {
+            self.value.lock().is_none()
         }
     }
 }
@@ -512,12 +504,9 @@ impl Report {
 #[derive(Debug)]
 enum SleepState {
     Pending,
-    Sleeping(Arc<WakerCell>),
+    Sleeping(Arc<WakerNode>),
     Woken,
 }
-
-unsafe impl Sync for SleepState {}
-unsafe impl Send for SleepState {}
 
 impl std::future::Future for SleepFuture {
     type Output = Result<Report, Error>;
@@ -537,7 +526,7 @@ impl std::future::Future for SleepFuture {
         }
 
         if matches!(self.state, SleepState::Pending) {
-            let waker = Arc::new(WakerCell::new(cx.waker().clone()));
+            let waker = Arc::new(WakerNode::new(cx.waker().clone()));
             let event = driver::Event::SleepUntil(NodeDesc {
                 timeout: self.timeout,
                 waker: Arc::downgrade(&waker),
@@ -548,6 +537,14 @@ impl std::future::Future for SleepFuture {
             }
 
             self.state = SleepState::Sleeping(waker);
+        } else if let SleepState::Sleeping(node) = &self.state {
+            // We woke up too early. Check if it is due to broken clock monotonicity.
+            if node.is_expired() {
+                self.state = SleepState::Woken;
+                return Poll::Ready(Ok(Report::Completed(Duration::default())));
+            } else {
+                // If not, this is a spurious wakeup. We should sleep again.
+            }
         }
 
         Poll::Pending

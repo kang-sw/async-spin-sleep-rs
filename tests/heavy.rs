@@ -11,7 +11,7 @@ fn heavy_use() {
         let (handle, worker) = async_spin_sleep::create();
         std::thread::spawn(worker);
 
-        const NUM_TASKS: usize = 25;
+        const NUM_TASKS: usize = 50;
         const CHECK_TICKS: usize = 1000;
         let time_check_refs = (0..NUM_TASKS)
             .map(|_| {
@@ -37,12 +37,17 @@ fn heavy_use() {
             tokio::time::sleep(Duration::from_millis(10)).await;
 
             // Check if there's any task that has not been updated for 100ms
+            let mut num_ok = 0;
             for updator in &time_check_refs {
                 let last_update = updator.load(std::sync::atomic::Ordering::Relaxed);
                 let time_diff = now_us() - last_update;
-                assert!(time_diff < 500_000, "{}", "no update");
+
+                if time_diff < 500_000 {
+                    num_ok += 1;
+                }
             }
 
+            assert_eq!(num_ok, NUM_TASKS, "Some tasks are not updated for 500ms");
             eprint!("{seq:8} / {CHECK_TICKS:8} \r")
         }
 
