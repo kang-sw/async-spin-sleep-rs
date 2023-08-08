@@ -467,7 +467,7 @@ mod instant {
     }
 
     pub(crate) fn time_from_epoch() -> std::time::Duration {
-        Instant::now().duration_since(origin())
+        origin().elapsed()
     }
 }
 
@@ -559,7 +559,5 @@ impl Drop for SleepFuture {
         if !matches!(&self.state, SleepState::Pending) {
             self.gc_counter.fetch_add(1, Ordering::Release);
         }
-
-        // eprint!("{}          \r", self.gc_counter.load(Ordering::Relaxed));
     }
 }
