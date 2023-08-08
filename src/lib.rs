@@ -280,8 +280,7 @@ impl Handle {
     /// [`SleepFuture`] returns the duration that overly passed the specified instant.
     pub fn sleep_until(&self, timeout: Instant) -> SleepFuture {
         SleepFuture {
-            tx: self.tx.clone(),
-            state: SleepState::Pending,
+            state: SleepState::Pending(self.tx.clone()),
             timeout,
             gc_counter: self.gc_counter.clone(),
         }
@@ -470,7 +469,6 @@ mod instant {
 #[derive(Debug)]
 #[must_use = "futures do nothing unless you `.await` or poll them"]
 pub struct SleepFuture {
-    tx: channel::Sender<driver::Event>,
     gc_counter: Arc<AtomicIsize>,
     timeout: Instant,
     state: SleepState,
@@ -519,7 +517,7 @@ impl Report {
 
 #[derive(Debug)]
 enum SleepState {
-    Pending,
+    Pending(channel::Sender<driver::Event>),
     Sleeping(Arc<WakerNode>),
     Woken,
 }
@@ -541,14 +539,14 @@ impl std::future::Future for SleepFuture {
             return Poll::Ready(result);
         }
 
-        if matches!(self.state, SleepState::Pending) {
+        if let SleepState::Pending(tx) = &self.state {
             let waker = Arc::new(WakerNode::new(cx.waker().clone()));
             let event = driver::Event::SleepUntil(NodeDesc {
                 timeout: self.timeout,
                 waker: Arc::downgrade(&waker),
             });
 
-            self.tx.send(event).expect("timer driver never expires");
+            tx.send(event).expect("timer driver never expires");
             self.state = SleepState::Sleeping(waker);
         } else if let SleepState::Sleeping(node) = &self.state {
             // We woke up too early. Check if it is due to broken clock monotonicity.
@@ -566,7 +564,7 @@ impl std::future::Future for SleepFuture {
 
 impl Drop for SleepFuture {
     fn drop(&mut self) {
-        if !matches!(&self.state, SleepState::Pending) {
+        if !matches!(&self.state, SleepState::Pending { .. }) {
             self.gc_counter.fetch_add(1, Ordering::Release);
         }
     }
