@@ -141,7 +141,9 @@ async fn multiple_threads() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn interval() {
-    let (handle, driver) = async_spin_sleep::create_d_ary::<4>();
+    let (handle, driver) =
+        async_spin_sleep::Builder::default().with_yields_per_spin(100).build_d_ary::<4>();
+
     std::thread::spawn(driver);
 
     let interval = Duration::from_micros(3000);

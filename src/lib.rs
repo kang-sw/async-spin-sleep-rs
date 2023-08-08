@@ -34,8 +34,14 @@ const DEFAULT_SCHEDULE_RESOLUTION: Duration = Duration::from_millis(10);
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 const DEFAULT_SCHEDULE_RESOLUTION: Duration = Duration::from_millis(33);
 
+/// A builder for [`Handle`].
+///
+/// Returned result of [`Builder::build`] or [`Builder::build_d_ary`] is a tuple of [`Handle`] and
+/// its dedicated driver function. The driver function recommended to be spawned as a separate
+/// thread.
 #[derive(Debug, derive_setters::Setters)]
 #[setters(prefix = "with_")]
+#[non_exhaustive]
 pub struct Builder {
     /// Default scheduling resolution for this driver. Setting this to a lower value may decrease
     /// CPU usage of the driver, but may also dangerously increase the chance of missing a wakeup
@@ -55,13 +61,16 @@ pub struct Builder {
     #[setters(into)]
     pub channel_capacity: Option<usize>,
 
+    /// Determines the `number of yields per try_recv`. This option assumes that the `try_recv`
+    /// function contains a relatively heavy routine that is called at spin time, so adjust to an
+    /// appropriate value to optimize performance.
+    ///
+    /// Value will be clamped to at least 1. Does not use `NonZeroUsize`, just only for convenience.
+    pub yields_per_spin: usize,
+
     /// A shared handle to represent naive number of garbage nodes to collect
     #[setters(skip)]
     gc_counter: Arc<AtomicIsize>,
-
-    // Force 'default' only
-    #[setters(skip)]
-    _0: (),
 }
 
 impl Default for Builder {
@@ -71,16 +80,20 @@ impl Default for Builder {
             gc_threshold: 1000,
             channel_capacity: None,
             gc_counter: Default::default(),
-            _0: (),
+            yields_per_spin: 1,
         }
     }
 }
 
 impl Builder {
+    /// Build timer driver with optimal configuration.
+    #[must_use = "Never drop the driver instance!"]
     pub fn build(self) -> (Handle, impl FnOnce()) {
-        self.build_d_ary::<2>()
+        self.build_d_ary::<4>()
     }
 
+    /// Build timer driver with desired D-ary heap configuration.
+    #[must_use = "Never drop the driver instance!"]
     pub fn build_d_ary<const D: usize>(self) -> (Handle, impl FnOnce()) {
         let _ = instant::origin(); // Force initialization of the global pivot time
 
@@ -97,10 +110,12 @@ impl Builder {
     }
 }
 
+/// A shortcut for `Builder::default().build()`.
 pub fn create() -> (Handle, impl FnOnce()) {
     Builder::default().build()
 }
 
+/// A shortcut for `Builder::default().build_d_ary<..>()`.
 pub fn create_d_ary<const D: usize>() -> (Handle, impl FnOnce()) {
     Builder::default().build_d_ary::<D>()
 }
@@ -134,6 +149,7 @@ mod driver {
         // decrements the number by 1 when a node is cleared, this value is expected to be a naive
         // status of 'aborted but not yet handled' node count, i.e. garbage nodes.
         let gc_counter = this.gc_counter;
+        let yields_per_spin = this.yields_per_spin.max(1);
 
         'worker: loop {
             let now = to_usec(Instant::now());
@@ -144,6 +160,8 @@ mod driver {
                     let Ok(x) = rx.recv_timeout(Duration::from_micros( system_sleep_for)) else { continue };
                     x
                 } else {
+                    let mut yields_counter = 0usize;
+
                     'busy_wait: loop {
                         let now = to_usec(Instant::now());
                         if now >= node.timeout_usec {
@@ -161,16 +179,21 @@ mod driver {
 
                             continue 'worker;
                         } else {
-                            match rx.try_recv() {
-                                Ok(x) => break 'busy_wait x,
-                                Err(TryRecvError::Disconnected) if nodes.is_empty() => {
-                                    break 'worker
-                                }
-                                Err(TryRecvError::Disconnected) | Err(TryRecvError::Empty) => {
-                                    std::thread::yield_now();
-                                    continue 'busy_wait;
+                            if yields_counter % yields_per_spin == 0 {
+                                match rx.try_recv() {
+                                    Ok(x) => break 'busy_wait x,
+                                    Err(TryRecvError::Disconnected) if nodes.is_empty() => {
+                                        break 'worker
+                                    }
+                                    Err(TryRecvError::Disconnected) | Err(TryRecvError::Empty) => {
+                                        // We still have timer nodes to deal with ..
+                                    }
                                 }
                             }
+
+                            yields_counter += 1;
+                            std::thread::yield_now();
+                            continue 'busy_wait;
                         }
                     }
                 }
@@ -261,6 +284,7 @@ mod driver {
 }
 
 /* ------------------------------------------- Handle ------------------------------------------- */
+/// A handle to the timer driver.
 #[derive(Debug, Clone)]
 pub struct Handle {
     tx: channel::Sender<driver::Event>,
@@ -546,7 +570,7 @@ impl std::future::Future for SleepFuture {
                 waker: Arc::downgrade(&waker),
             });
 
-            tx.send(event).expect("timer driver never expires");
+            tx.send(event).expect("timer driver instance dropped!");
             self.state = SleepState::Sleeping(waker);
         } else if let SleepState::Sleeping(node) = &self.state {
             // We woke up too early. Check if it is due to broken clock monotonicity.
