@@ -251,8 +251,8 @@ mod driver {
             DaryHeap::from(vec)
         };
 
-        let n_collected = prev_len - nodes.len();
-        n_collected
+        
+        prev_len - nodes.len()
     }
 
     #[derive(Debug, Clone)]
@@ -357,7 +357,7 @@ pub mod util {
 
             let result = handle.sleep_until(*wakeup).await;
             let now = Instant::now();
-            *wakeup = *wakeup + *interval;
+            *wakeup += *interval;
 
             let minimum_next = now + minimum_interval;
             if minimum_next > *wakeup {
@@ -458,7 +458,7 @@ pub mod util {
             align_offset_ns: i64,
         ) {
             self.align_with_clock(
-                || instant::time_from_epoch(),
+                instant::time_from_epoch,
                 interval,
                 initial_interval_tolerance,
                 align_offset_ns,

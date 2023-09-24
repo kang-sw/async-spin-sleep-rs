@@ -50,8 +50,6 @@ fn heavy_use() {
             assert_eq!(num_ok, NUM_TASKS, "Some tasks are not updated for 500ms");
             eprint!("{seq:8} / {CHECK_TICKS:8} \r")
         }
-
-        ();
     })
 }
 
