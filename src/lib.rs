@@ -157,6 +157,14 @@ mod driver {
                 let remain = node.timeout_usec.saturating_sub(now);
                 if remain > resolution_usec {
                     let system_sleep_for = remain - resolution_usec;
+                    // FIXME: Address potential issue when the channel is closed and there's a timer 
+                    //   with a significant remaining wakeup time. In the current setup, if the channel 
+                    //   is closed, it can result in a core being strained due to a busy loop, as 
+                    //   `recv_timeout` will continuously return `Err`. A potential solution is to 
+                    //   leverage system sleep if the channel is closed.
+                    // NOTE: Having a long-wait timer in this spin-sleep mechanism and then 
+                    //   discarding the handle is a non-typical use-case, which might be why it was 
+                    //   overlooked initially.
                     let Ok(x) = rx.recv_timeout(Duration::from_micros( system_sleep_for)) else { continue };
                     x
                 } else {
