@@ -17,10 +17,7 @@ The `async-spin-sleep` library offers an efficient method to leverage the advant
 
     block_on(async {
         let begin = Instant::now();
-        let overslept = handle
-            .sleep_for(Duration::from_millis(100))
-            .await
-            .expect("sleep function always returns Ok(...), as long as the driver thread is alive");
+        let overslept = handle.sleep_for(Duration::from_millis(100)).await;
 
         assert!(begin.elapsed() >= Duration::from_millis(100));
         println!("t: {:?}, overslept: {:?}", begin.elapsed(), overslept);

@@ -152,20 +152,27 @@ mod driver {
         let yields_per_spin = this.yields_per_spin.max(1);
 
         'worker: loop {
-            let now = to_usec(Instant::now());
+            let now_ts = Instant::now();
+            let now = to_usec(now_ts);
             let mut event = if let Some(node) = nodes.peek() {
                 let remain = node.timeout_usec.saturating_sub(now);
                 if remain > resolution_usec {
                     let system_sleep_for = remain - resolution_usec;
-                    // FIXME: Address potential issue when the channel is closed and there's a timer 
-                    //   with a significant remaining wakeup time. In the current setup, if the channel 
-                    //   is closed, it can result in a core being strained due to a busy loop, as 
-                    //   `recv_timeout` will continuously return `Err`. A potential solution is to 
-                    //   leverage system sleep if the channel is closed.
-                    // NOTE: Having a long-wait timer in this spin-sleep mechanism and then 
-                    //   discarding the handle is a non-typical use-case, which might be why it was 
-                    //   overlooked initially.
-                    let Ok(x) = rx.recv_timeout(Duration::from_micros( system_sleep_for)) else { continue };
+                    let timeout = Duration::from_micros(system_sleep_for);
+                    let deadline = now_ts + timeout;
+
+                    let Ok(x) = rx.recv_deadline(deadline).map_err(|e| match e {
+                        channel::RecvTimeoutError::Timeout => (),
+                        channel::RecvTimeoutError::Disconnected => {
+                            // The channel handle was closed while a task was still waiting. As no
+                            // new timer nodes will be added after receiving a `disconnected` state,
+                            // it's safe to pause the current thread until the next node's timeout
+                            // is reached.
+                            std::thread::sleep(deadline.saturating_duration_since(Instant::now()))
+                        }
+                    }) else {
+                        continue;
+                    };
                     x
                 } else {
                     let mut yields_counter = 0usize;
@@ -206,9 +213,7 @@ mod driver {
                     }
                 }
             } else {
-                let Ok(x) = rx.recv() else {
-                    break
-                };
+                let Ok(x) = rx.recv() else { break };
                 x
             };
 
@@ -534,6 +539,11 @@ impl Report {
         }
     }
 
+    /// Returns true if the timer woke up earlier than required duration.
+    pub fn is_woke_up_early(&self) -> bool {
+        matches!(self, Self::CompletedEarly(_))
+    }
+
     /// Trick to make previous code compatible with this version.
     #[doc(hidden)]
     pub fn unwrap(self) -> Self {
@@ -587,6 +597,7 @@ impl std::future::Future for SleepFuture {
                 return Poll::Ready(Report::CompletedEarly(self.timeout - now));
             } else {
                 // If not, this is a spurious wakeup. We should sleep again.
+                // - XXX: Should we re-register wakeup timer here?
             }
         }
 
