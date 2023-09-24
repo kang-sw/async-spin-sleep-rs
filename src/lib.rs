@@ -161,7 +161,7 @@ mod driver {
                     let timeout = Duration::from_micros(system_sleep_for);
                     let deadline = now_ts + timeout;
 
-                    let Ok(x) = rx.recv_deadline(deadline).map_err(|e| match e {
+                    let Ok(event) = rx.recv_deadline(deadline).map_err(|e| match e {
                         channel::RecvTimeoutError::Timeout => (),
                         channel::RecvTimeoutError::Disconnected => {
                             // The channel handle was closed while a task was still waiting. As no
@@ -173,7 +173,8 @@ mod driver {
                     }) else {
                         continue;
                     };
-                    x
+
+                    event
                 } else {
                     let mut yields_counter = 0usize;
 
@@ -251,7 +252,6 @@ mod driver {
             DaryHeap::from(vec)
         };
 
-        
         prev_len - nodes.len()
     }
 
